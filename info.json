@@ -1,0 +1,7 @@
+{
+  "participants": ["Nelson Simionato Inácio"],
+  "social": ["https://github.com/nelsonsimionato"],
+  "source-code-repo": "https://github.com/nelsonsimionato/rinha-backend-2026",
+  "stack": ["go", "fasthttp", "fastjson", "haproxy"],
+  "open_to_work": true
+}

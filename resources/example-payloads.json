@@ -1,0 +1,104 @@
+[
+  {
+    "id": "tx-1329056812",
+    "transaction": {
+      "amount": 41.12,
+      "installments": 2,
+      "requested_at": "2026-03-11T18:45:53Z"
+    },
+    "customer": {
+      "avg_amount": 82.24,
+      "tx_count_24h": 3,
+      "known_merchants": ["MERC-003", "MERC-016"]
+    },
+    "merchant": {
+      "id": "MERC-016",
+      "mcc": "5411",
+      "avg_amount": 60.25
+    },
+    "terminal": {
+      "is_online": false,
+      "card_present": true,
+      "km_from_home": 29.23
+    },
+    "last_transaction": null
+  },
+  {
+    "id": "tx-5512345678",
+    "transaction": {
+      "amount": 87.50,
+      "installments": 1,
+      "requested_at": "2026-03-15T14:23:10Z"
+    },
+    "customer": {
+      "avg_amount": 95.30,
+      "tx_count_24h": 5,
+      "known_merchants": ["MERC-005", "MERC-012", "MERC-020"]
+    },
+    "merchant": {
+      "id": "MERC-005",
+      "mcc": "5411",
+      "avg_amount": 102.45
+    },
+    "terminal": {
+      "is_online": false,
+      "card_present": true,
+      "km_from_home": 3.2
+    },
+    "last_transaction": {
+      "timestamp": "2026-03-15T11:45:00Z",
+      "km_from_current": 0.8
+    }
+  },
+  {
+    "id": "tx-3330991687",
+    "transaction": {
+      "amount": 9505.97,
+      "installments": 10,
+      "requested_at": "2026-03-14T05:15:12Z"
+    },
+    "customer": {
+      "avg_amount": 81.28,
+      "tx_count_24h": 20,
+      "known_merchants": ["MERC-008", "MERC-007", "MERC-005"]
+    },
+    "merchant": {
+      "id": "MERC-068",
+      "mcc": "7802",
+      "avg_amount": 54.86
+    },
+    "terminal": {
+      "is_online": false,
+      "card_present": true,
+      "km_from_home": 952.27
+    },
+    "last_transaction": null
+  },
+  {
+    "id": "tx-9988776655",
+    "transaction": {
+      "amount": 1250.00,
+      "installments": 6,
+      "requested_at": "2026-03-15T02:14:33Z"
+    },
+    "customer": {
+      "avg_amount": 88.20,
+      "tx_count_24h": 2,
+      "known_merchants": ["MERC-005", "MERC-012"]
+    },
+    "merchant": {
+      "id": "MERC-104",
+      "mcc": "7995",
+      "avg_amount": 875.00
+    },
+    "terminal": {
+      "is_online": true,
+      "card_present": false,
+      "km_from_home": 0
+    },
+    "last_transaction": {
+      "timestamp": "2026-03-14T22:30:15Z",
+      "km_from_current": 421.5
+    }
+  }
+]

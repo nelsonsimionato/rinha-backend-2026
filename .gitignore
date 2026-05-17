@@ -1,0 +1,29 @@
+# Build artifacts (compiled by Dockerfile or `go build`)
+/api
+/main
+/rinha_2026
+/healthcheck
+*.test
+*.out
+
+# Generated / data assets — never commit
+# index.bin is rebuilt locally via `make index`.
+# references.json.gz is the 3M-record dataset; provided by Rinha organizers
+# (or generated locally via `go run tools/synth_refs.go`). Too big for GitHub.
+/resources/index.bin
+/resources/references.json.gz
+
+# Local environment overrides
+.env
+.env.local
+
+# IDE / OS noise
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Profiling / debug output
+*.pprof
+cpu.prof
+mem.prof

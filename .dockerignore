@@ -1,0 +1,24 @@
+# Keep large source data out of the build context — only the pre-built index.bin
+# is needed inside the image. Rebuild it locally via `make index`.
+resources/references.json.gz
+
+# Local artifacts that don't belong in the image
+*.bin.bak
+/api
+/main
+/rinha_2026
+/healthcheck
+
+# IDE / OS noise
+.idea/
+.vscode/
+.DS_Store
+
+# Docs and plans aren't needed at build time
+docs/
+*.md
+plans/
+
+# Git metadata
+.git/
+.gitignore
