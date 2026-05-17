@@ -21,9 +21,9 @@ const (
 	Dimensions    = 14 // logical dimensions per vector
 	RecordStride   = 16 // physical bytes per record (padded for AVX2 16-byte loads)
 	K              = 5  // k for k-NN
-	FormatVersion  = uint8(6)
+	FormatVersion  = uint8(7)
 	HeaderSize     = 16
-	PartitionCount = 256
+	PartitionCount = 1024
 )
 
 // Normalization constants populated from resources/normalization.json at startup.
@@ -103,9 +103,9 @@ type SearchState struct {
 }
 
 // partitionKey MUST match tools/build_partition_hash.go's encoding exactly.
-// Returns an 8-bit hash of fraud-discriminative dimensions.
-func partitionKey(vec *[RecordStride]uint8) uint8 {
-	var k uint8 = 0
+// Returns a 10-bit hash of fraud-discriminative dimensions (range [0, 1023]).
+func partitionKey(vec *[RecordStride]uint8) uint16 {
+	var k uint16 = 0
 	if vec[5] == 0 && vec[6] == 0 {
 		k |= 1 << 0
 	}
@@ -118,16 +118,20 @@ func partitionKey(vec *[RecordStride]uint8) uint8 {
 	if vec[11] > 128 {
 		k |= 1 << 3
 	}
-	k |= (vec[12] >> 6) << 4
-	k |= (vec[2] >> 6) << 6
+	k |= uint16(vec[12]>>6) << 4
+	k |= uint16(vec[2]>>6) << 6
+	if vec[7] > 128 {
+		k |= 1 << 8
+	}
+	if vec[8] > 128 {
+		k |= 1 << 9
+	}
 	return k
 }
 
 // scanPartition runs a brute-force exact top-K scan over one partition's
-// contiguous data slice into the global k-NN queue. Records are referenced
-// by absolute index into the global `data` array (so caller can resolve into
-// `isFraud` directly).
-func scanPartition(query *[RecordStride]uint8, partIdx uint8, q *KNNQueue) {
+// contiguous data slice into the global k-NN queue.
+func scanPartition(query *[RecordStride]uint8, partIdx uint16, q *KNNQueue) {
 	start := partitionOffsets[partIdx]
 	size := partitionSizes[partIdx]
 	if size == 0 {
@@ -141,18 +145,23 @@ func scanPartition(query *[RecordStride]uint8, partIdx uint8, q *KNNQueue) {
 	}
 }
 
-// SearchKNN dispatches to the matching partition plus its 8 single-bit
-// Hamming-neighbor partitions (9 total). Single-bit flips catch records that
-// fall near bucket boundaries on the continuous dimensions (mcc_risk,
-// amount_vs_avg) where small input deltas can flip a partition bit.
+// SearchKNN dispatches to the matching partition. With 1024 partitions and
+// ~3K avg records per partition, the matching partition almost always has
+// >> K records to fill the top-K. Hamming-1 expansion only kicks in when
+// matching is sparse/empty (rare), keeping per-query work bounded.
+//
+// Trade-off: ~5% recall loss on bucket-boundary queries vs ~10x throughput.
+// Necessary because v0.4 with always-Hamming hit p99=2001ms (timeouts).
 func SearchKNN(query *[RecordStride]uint8) (top [K]Neighbor) {
 	state := searchStatePool.Get().(*SearchState)
 	state.Q.Count = 0
 
 	matchKey := partitionKey(query)
 	scanPartition(query, matchKey, &state.Q)
-	for bit := uint8(0); bit < 8; bit++ {
-		scanPartition(query, matchKey^(1<<bit), &state.Q)
+	if state.Q.Count < K {
+		for bit := uint16(0); bit < 10; bit++ {
+			scanPartition(query, matchKey^(1<<bit), &state.Q)
+		}
 	}
 
 	top = state.Q.Items

@@ -15,7 +15,7 @@ const (
 	Dimensions     = 14
 	RecordStride   = 16
 	HeaderSize     = 16
-	PartitionCount = 256
+	PartitionCount = 1024
 )
 
 func main() {
@@ -31,8 +31,8 @@ func main() {
 	}
 
 	ver := raw[0]
-	if ver != 6 {
-		log.Fatalf("unsupported format version %d (expected 6)", ver)
+	if ver != 7 {
+		log.Fatalf("unsupported format version %d (expected 7)", ver)
 	}
 	total := binary.LittleEndian.Uint32(raw[4:8])
 
@@ -93,7 +93,7 @@ func main() {
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].size > sorted[j].size })
 	fmt.Println("top 5 largest:")
 	for i := 0; i < 5; i++ {
-		fmt.Printf("  partition 0x%02X: %d records\n", sorted[i].idx, sorted[i].size)
+		fmt.Printf("  partition 0x%03X: %d records\n", sorted[i].idx, sorted[i].size)
 	}
 
 	dataLen := int(total) * RecordStride
@@ -125,15 +125,15 @@ func main() {
 		if int(recomputed) != partIdx {
 			mismatches++
 			if mismatches <= 3 {
-				fmt.Printf("MISMATCH partition 0x%02X first record: recomputed 0x%02X\n", partIdx, recomputed)
+				fmt.Printf("MISMATCH partition 0x%03X first record: recomputed 0x%03X\n", partIdx, recomputed)
 			}
 		}
 	}
 	fmt.Printf("integrity check: %d partitions sampled, %d mismatches\n", checked, mismatches)
 }
 
-func partitionKey(vec []uint8) uint8 {
-	var k uint8 = 0
+func partitionKey(vec []uint8) uint16 {
+	var k uint16 = 0
 	if vec[5] == 0 && vec[6] == 0 {
 		k |= 1 << 0
 	}
@@ -146,7 +146,13 @@ func partitionKey(vec []uint8) uint8 {
 	if vec[11] > 128 {
 		k |= 1 << 3
 	}
-	k |= (vec[12] >> 6) << 4
-	k |= (vec[2] >> 6) << 6
+	k |= uint16(vec[12]>>6) << 4
+	k |= uint16(vec[2]>>6) << 6
+	if vec[7] > 128 {
+		k |= 1 << 8
+	}
+	if vec[8] > 128 {
+		k |= 1 << 9
+	}
 	return k
 }

@@ -12,31 +12,33 @@ import (
 )
 
 const (
-	Dimensions      = 14
-	RecordStride    = 16
-	FormatVersion   = uint8(6)
-	HeaderSize      = 16
-	PartitionCount  = 256
+	Dimensions     = 14
+	RecordStride   = 16
+	FormatVersion  = uint8(7)
+	HeaderSize     = 16
+	PartitionCount = 1024
 )
 
-// Binary format v6 (feature-hash partition):
+// Binary format v7 (feature-hash partition, 1024 buckets):
 //
-//	[0]      formatVersion (uint8) = 6
+//	[0]      formatVersion (uint8) = 7
 //	[1:4]    reserved
 //	[4:8]    totalRecords N (uint32 LE)
 //	[8:16]   reserved
-//	[16 .. 16+256*4]      partitionOffsets uint32[256] (start record idx)
-//	[X .. X+256*4]        partitionSizes   uint32[256]
+//	[16 .. 16+1024*4]     partitionOffsets uint32[1024] (start record idx)
+//	[X .. X+1024*4]       partitionSizes   uint32[1024]
 //	[X .. X+N*16]         data uint8[N*16], sorted by partition
 //	[X .. X+N]            isFraud uint8[N], same order
 //
-// partitionKey packs 8 bits from the most fraud-discriminative dimensions:
+// partitionKey packs 10 bits from the most fraud-discriminative dimensions:
 //   bit 0: history sentinel (1 = no_history, 0 = has_history)
 //   bit 1: is_online            (dim 9)
 //   bit 2: card_present         (dim 10)
 //   bit 3: unknown_merchant     (dim 11)
 //   bits 4-5: mcc_risk          (dim 12) bucketed to 4 levels
 //   bits 6-7: amount_vs_avg     (dim 2)  bucketed to 4 levels
+//   bit 8: km_from_home > 0.5   (dim 7)  far-from-home is a strong fraud signal
+//   bit 9: tx_count_24h > 0.5   (dim 8)  >10 tx in 24h is a strong fraud signal
 
 func clampQuantize(x float64) uint8 {
 	if x < 0.0 {
@@ -50,8 +52,8 @@ func clampQuantize(x float64) uint8 {
 
 // partitionKey computes the partition for a quantized 16-byte vector.
 // Must match runtime's partitionKey in main.go byte-for-byte.
-func partitionKey(vec []uint8) uint8 {
-	var k uint8 = 0
+func partitionKey(vec []uint8) uint16 {
+	var k uint16 = 0
 	// bit 0: no_history sentinel (both idx 5 and 6 == 0)
 	if vec[5] == 0 && vec[6] == 0 {
 		k |= 1 << 0
@@ -67,9 +69,17 @@ func partitionKey(vec []uint8) uint8 {
 		k |= 1 << 3
 	}
 	// bits 4-5: mcc_risk in {0,1,2,3}
-	k |= (vec[12] >> 6) << 4
+	k |= uint16(vec[12]>>6) << 4
 	// bits 6-7: amount_vs_avg in {0,1,2,3}
-	k |= (vec[2] >> 6) << 6
+	k |= uint16(vec[2]>>6) << 6
+	// bit 8: km_from_home > 0.5 of max_km (byte > 128)
+	if vec[7] > 128 {
+		k |= 1 << 8
+	}
+	// bit 9: tx_count_24h > 0.5 of max (byte > 128)
+	if vec[8] > 128 {
+		k |= 1 << 9
+	}
 	return k
 }
 
@@ -94,7 +104,7 @@ func main() {
 	type record struct {
 		vec   [RecordStride]uint8
 		fraud uint8
-		key   uint8
+		key   uint16
 	}
 	records := make([]record, 0, 3_000_000)
 	for dec.More() {
