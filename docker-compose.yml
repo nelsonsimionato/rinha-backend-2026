@@ -24,6 +24,10 @@ services:
 
   api1:
     build: .
+    environment:
+      # Runtime tunable. Override via shell env: `IVF_PROBE=24 docker compose up`.
+      # Range 1..32 (IvfProbeMax in main.go). Higher = better recall, more CPU/req.
+      - IVF_PROBE=${IVF_PROBE:-16}
     deploy:
       resources:
         limits:
@@ -41,6 +45,8 @@ services:
 
   api2:
     build: .
+    environment:
+      - IVF_PROBE=${IVF_PROBE:-16}
     deploy:
       resources:
         limits:

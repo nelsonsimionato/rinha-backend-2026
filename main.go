@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -22,10 +23,16 @@ const (
 	Dimensions    = 14 // logical dimensions per vector
 	RecordStride  = 16 // physical bytes per record (padded for AVX2 16-byte loads)
 	K             = 5  // k for k-NN
-	IvfProbe      = 16 // top-N clusters scanned per query (IVF probe count)
+	IvfProbeMax   = 32 // physical ceiling for ProbeQueue.Items array size
 	FormatVersion = uint8(4)
 	HeaderSize    = 16
 )
+
+// IvfProbe is the runtime-tunable count of clusters to scan per query.
+// Default 16; override at container start via env var IVF_PROBE (1..IvfProbeMax).
+// Larger values raise recall and per-query CPU; pick based on score_det vs
+// score_p99 trade-off in the official preview test.
+var IvfProbe int32 = 16
 
 // Normalization constants populated from resources/normalization.json at startup.
 var (
@@ -94,28 +101,30 @@ func (q *KNNQueue) Push(distSq uint32, nodeIdx int32) {
 	}
 }
 
-// ProbeQueue keeps the IvfProbe smallest centroid distances. Same insertion-sort
-// pattern as KNNQueue but indexed at a different size.
+// ProbeQueue keeps the IvfProbe smallest centroid distances. Items is sized at
+// the compile-time ceiling (IvfProbeMax); the dynamic IvfProbe variable
+// controls how many slots are actually used per query.
 type ProbeNeighbor struct {
 	DistSq uint32
 	Idx    int32
 }
 
 type ProbeQueue struct {
-	Items [IvfProbe]ProbeNeighbor
+	Items [IvfProbeMax]ProbeNeighbor
 	Count int
 }
 
 func (p *ProbeQueue) Push(distSq uint32, idx int32) {
-	if p.Count < IvfProbe {
+	limit := int(IvfProbe)
+	if p.Count < limit {
 		p.Items[p.Count] = ProbeNeighbor{DistSq: distSq, Idx: idx}
 		p.Count++
 		for i := p.Count - 1; i > 0 && p.Items[i].DistSq < p.Items[i-1].DistSq; i-- {
 			p.Items[i], p.Items[i-1] = p.Items[i-1], p.Items[i]
 		}
-	} else if distSq < p.Items[IvfProbe-1].DistSq {
-		p.Items[IvfProbe-1] = ProbeNeighbor{DistSq: distSq, Idx: idx}
-		for i := IvfProbe - 1; i > 0 && p.Items[i].DistSq < p.Items[i-1].DistSq; i-- {
+	} else if distSq < p.Items[limit-1].DistSq {
+		p.Items[limit-1] = ProbeNeighbor{DistSq: distSq, Idx: idx}
+		for i := limit - 1; i > 0 && p.Items[i].DistSq < p.Items[i-1].DistSq; i-- {
 			p.Items[i], p.Items[i-1] = p.Items[i-1], p.Items[i]
 		}
 	}
@@ -464,7 +473,19 @@ func loadIndex(path string) {
 	}
 }
 
+func loadRuntimeTunables() {
+	if v := os.Getenv("IVF_PROBE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > IvfProbeMax {
+			log.Fatalf("IVF_PROBE=%q invalid; must be int in [1, %d]", v, IvfProbeMax)
+		}
+		IvfProbe = int32(n)
+		log.Printf("IvfProbe overridden via env: %d (default 16, max %d)", IvfProbe, IvfProbeMax)
+	}
+}
+
 func main() {
+	loadRuntimeTunables()
 	loadNormalization("resources/normalization.json")
 	loadIndex("resources/index.bin")
 
