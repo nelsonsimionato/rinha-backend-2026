@@ -10,12 +10,11 @@ clean-host:
 generate:
 	go run tools/mccgen.go
 
-# Build the IVF index from resources/references.json.gz.
-# Defaults: K=2048 centroids, 1 Lloyd iteration. Override with `make index IVF_K=… IVF_ITERS=…`.
-IVF_K ?= 2048
-IVF_ITERS ?= 1
-resources/index.bin: resources/references.json.gz tools/build_ivf.go
-	go run tools/build_ivf.go -k $(IVF_K) -iters $(IVF_ITERS)
+# Build the brute-force partition index (format v5) from resources/references.json.gz.
+# Splits records into WH (with-history) and NH (no-history) pools deterministically
+# by the -1 sentinel at idx 5/6. No clustering, no tuning knobs.
+resources/index.bin: resources/references.json.gz tools/build_partition.go
+	go run tools/build_partition.go
 
 # Alias for the index-bin file target
 index: resources/index.bin

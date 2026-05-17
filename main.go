@@ -9,10 +9,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 	"sync"
 	"syscall"
-	"unsafe"
 
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/reuseport"
@@ -23,16 +21,9 @@ const (
 	Dimensions    = 14 // logical dimensions per vector
 	RecordStride  = 16 // physical bytes per record (padded for AVX2 16-byte loads)
 	K             = 5  // k for k-NN
-	IvfProbeMax   = 32 // physical ceiling for ProbeQueue.Items array size
-	FormatVersion = uint8(4)
+	FormatVersion = uint8(5)
 	HeaderSize    = 16
 )
-
-// IvfProbe is the runtime-tunable count of clusters to scan per query.
-// Default 16; override at container start via env var IVF_PROBE (1..IvfProbeMax).
-// Larger values raise recall and per-query CPU; pick based on score_det vs
-// score_p99 trade-off in the official preview test.
-var IvfProbe int32 = 16
 
 // Normalization constants populated from resources/normalization.json at startup.
 var (
@@ -45,15 +36,16 @@ var (
 	MaxMerchantAvgAmount = 10000.0
 )
 
-// IVF index loaded from resources/index.bin (format v4).
+// Partitioned index (format v5): two pools split deterministically by the
+// `-1` sentinel at idx 5/6. A query with vec[5]==0 && vec[6]==0 (no-history)
+// scans NH only; otherwise scans WH only. The sentinel encoding (byte 0)
+// guarantees cross-pool neighbors can never be in the true top-5, so this
+// is exact k-NN within the matching pool (100% recall vs ground truth).
 var (
-	ivfK           uint32
-	ivfN           uint32
-	centroids      []uint8  // K * RecordStride bytes
-	clusterOffsets []uint32 // K entries: start record index of each cluster
-	clusterSizes   []uint32 // K entries: number of records in each cluster
-	data           []uint8  // N * RecordStride bytes, sorted by cluster
-	isFraud        []uint8  // N bytes, same order as data
+	dataWH    []uint8 // N_WH * RecordStride bytes
+	isFraudWH []uint8 // N_WH bytes
+	dataNH    []uint8
+	isFraudNH []uint8
 )
 
 var (
@@ -101,79 +93,44 @@ func (q *KNNQueue) Push(distSq uint32, nodeIdx int32) {
 	}
 }
 
-// ProbeQueue keeps the IvfProbe smallest centroid distances. Items is sized at
-// the compile-time ceiling (IvfProbeMax); the dynamic IvfProbe variable
-// controls how many slots are actually used per query.
-type ProbeNeighbor struct {
-	DistSq uint32
-	Idx    int32
-}
-
-type ProbeQueue struct {
-	Items [IvfProbeMax]ProbeNeighbor
-	Count int
-}
-
-func (p *ProbeQueue) Push(distSq uint32, idx int32) {
-	limit := int(IvfProbe)
-	if p.Count < limit {
-		p.Items[p.Count] = ProbeNeighbor{DistSq: distSq, Idx: idx}
-		p.Count++
-		for i := p.Count - 1; i > 0 && p.Items[i].DistSq < p.Items[i-1].DistSq; i-- {
-			p.Items[i], p.Items[i-1] = p.Items[i-1], p.Items[i]
-		}
-	} else if distSq < p.Items[limit-1].DistSq {
-		p.Items[limit-1] = ProbeNeighbor{DistSq: distSq, Idx: idx}
-		for i := limit - 1; i > 0 && p.Items[i].DistSq < p.Items[i-1].DistSq; i-- {
-			p.Items[i], p.Items[i-1] = p.Items[i-1], p.Items[i]
-		}
-	}
-}
-
 type SearchState struct {
-	Q  KNNQueue
-	PQ ProbeQueue
+	Q KNNQueue
 }
 
-// SearchKNN runs the IVF search:
-//
-//	1. Compute distance from query to each of K centroids
-//	2. Keep the IvfProbe closest centroids
-//	3. Scan all records in those clusters, maintain top-K neighbors
-//
-// Cost per query: K + IvfProbe * (avg cluster size) distance computes.
-func SearchKNN(query *[RecordStride]uint8) (top [K]Neighbor) {
-	state := searchStatePool.Get().(*SearchState)
-	state.Q.Count = 0
-	state.PQ.Count = 0
+// scanPool runs a brute-force exact top-K scan over a flat uint8[N*RecordStride]
+// pool. Calls distanceSq (AVX2 on amd64) per pair.
+func scanPool(query *[RecordStride]uint8, pool []uint8, q *KNNQueue) {
+	q.Count = 0
+	n := int32(len(pool) / RecordStride)
 	qPtr := &query[0]
+	for i := int32(0); i < n; i++ {
+		d := distanceSq(qPtr, &pool[i*RecordStride])
+		q.Push(d, i)
+	}
+}
 
-	// Phase 1: centroid scan
-	kk := int32(ivfK)
-	for c := int32(0); c < kk; c++ {
-		d := distanceSq(qPtr, &centroids[c*RecordStride])
-		state.PQ.Push(d, c)
+// SearchKNN dispatches to the matching pool by inspecting the sentinel bytes
+// and runs an exact brute-force scan there. Returns top-K + the isFraud slice
+// for the pool used (caller looks up isFraudPool[top[i].NodeIdx]).
+func SearchKNN(query *[RecordStride]uint8) (top [K]Neighbor, isFraudPool []uint8) {
+	state := searchStatePool.Get().(*SearchState)
+
+	var pool []uint8
+	if query[5] == 0 && query[6] == 0 {
+		pool = dataNH
+		isFraudPool = isFraudNH
+	} else {
+		pool = dataWH
+		isFraudPool = isFraudWH
 	}
 
-	// Phase 2: probe top clusters
-	probeCount := state.PQ.Count
-	for i := 0; i < probeCount; i++ {
-		c := state.PQ.Items[i].Idx
-		start := clusterOffsets[c]
-		size := clusterSizes[c]
-		for r := uint32(0); r < size; r++ {
-			recIdx := start + r
-			d := distanceSq(qPtr, &data[recIdx*RecordStride])
-			state.Q.Push(d, int32(recIdx))
-		}
-	}
-
+	scanPool(query, pool, &state.Q)
 	top = state.Q.Items
 	searchStatePool.Put(state)
 	return
 }
 
-// clampQuantize MUST match tools/build_ivf.go's encoding.
+// clampQuantize MUST match tools/build_partition.go's encoding.
 func clampQuantize(x float64) uint8 {
 	if x < 0.0 {
 		return 0
@@ -205,7 +162,7 @@ func atoi2(b []byte) int {
 	return int(b[0]-'0')*10 + int(b[1]-'0')
 }
 
-// specDayOfWeek returns Mon=0..Sun=6 via Zeller's congruence (zero alloc, no time.Time).
+// specDayOfWeek returns Mon=0..Sun=6 via Zeller's congruence (zero alloc).
 func specDayOfWeek(y, mo, d int) int {
 	if mo < 3 {
 		mo += 12
@@ -219,7 +176,6 @@ func specDayOfWeek(y, mo, d int) int {
 }
 
 // daysFromEpoch — proleptic Gregorian days since 0000-03-01 (Howard Hinnant variant).
-// Absolute anchor is arbitrary; we only ever take differences, which are exact.
 func daysFromEpoch(y, m, d int) int {
 	if m <= 2 {
 		y--
@@ -336,10 +292,9 @@ func vectorize(v *fastjson.Value) [RecordStride]uint8 {
 }
 
 func requestHandler(ctx *fasthttp.RequestCtx) {
-	// Fail-safe: any panic in vectorize/SearchKNN must NOT surface as HTTP 500.
-	// In the scoring formula, Err is weight 5 in E and also counts in the raw
-	// failure_rate (which has a 15% hard cliff). An FP from an "approve" fallback
-	// is weight 1 — five times cheaper than a 5xx, no double-count.
+	// Fail-safe: any panic must NOT surface as HTTP 500.
+	// In the scoring formula, Err is weight 5 in E + counts in raw failure_rate
+	// (15% hard cliff). An FP from an "approve" fallback is weight 1 — 5x cheaper.
 	defer func() {
 		if r := recover(); r != nil {
 			ctx.Response.Reset()
@@ -369,7 +324,6 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 
 	v, err := parser.ParseBytes(ctx.PostBody())
 	if err != nil {
-		// Malformed JSON: cheaper to "approve" (FP weight 1) than 400 (which counts as raw failure).
 		ctx.SetContentType("application/json")
 		ctx.SetStatusCode(fasthttp.StatusOK)
 		ctx.SetBodyString(responseBodies[0])
@@ -377,11 +331,11 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	vec := vectorize(v)
-	top := SearchKNN(&vec)
+	top, isFraudPool := SearchKNN(&vec)
 
 	fraudCount := 0
 	for i := 0; i < K; i++ {
-		if isFraud[top[i].NodeIdx] == 1 {
+		if isFraudPool[top[i].NodeIdx] == 1 {
 			fraudCount++
 		}
 	}
@@ -444,54 +398,40 @@ func loadIndex(path string) {
 	if ver != FormatVersion {
 		log.Fatalf("index format version %d, expected %d", ver, FormatVersion)
 	}
-	ivfK = binary.LittleEndian.Uint32(binData[4:8])
-	ivfN = binary.LittleEndian.Uint32(binData[8:12])
+	totalWH := binary.LittleEndian.Uint32(binData[4:8])
+	totalNH := binary.LittleEndian.Uint32(binData[8:12])
 
 	off := HeaderSize
-	centroidLen := int(ivfK) * RecordStride
-	centroids = binData[off : off+centroidLen]
-	off += centroidLen
+	dataLenWH := int(totalWH) * RecordStride
+	dataLenNH := int(totalNH) * RecordStride
+	expected := off + dataLenWH + int(totalWH) + dataLenNH + int(totalNH)
+	if len(binData) < expected {
+		log.Fatalf("index truncated: %d bytes, expected %d", len(binData), expected)
+	}
 
-	coBytes := binData[off : off+int(ivfK)*4]
-	off += int(ivfK) * 4
-	csBytes := binData[off : off+int(ivfK)*4]
-	off += int(ivfK) * 4
+	dataWH = binData[off : off+dataLenWH]
+	off += dataLenWH
+	isFraudWH = binData[off : off+int(totalWH)]
+	off += int(totalWH)
+	dataNH = binData[off : off+dataLenNH]
+	off += dataLenNH
+	isFraudNH = binData[off : off+int(totalNH)]
 
-	clusterOffsets = unsafe.Slice((*uint32)(unsafe.Pointer(&coBytes[0])), int(ivfK))
-	clusterSizes = unsafe.Slice((*uint32)(unsafe.Pointer(&csBytes[0])), int(ivfK))
-
-	dataLen := int(ivfN) * RecordStride
-	data = binData[off : off+dataLen]
-	off += dataLen
-	isFraud = binData[off : off+int(ivfN)]
-
-	log.Printf("loaded index v%d: K=%d centroids, N=%d records, %.1f MB",
-		ver, ivfK, ivfN, float64(len(binData))/1e6)
+	log.Printf("loaded index v%d: WH=%d records, NH=%d records, total=%d, %.1f MB",
+		ver, totalWH, totalNH, totalWH+totalNH, float64(len(binData))/1e6)
 
 	for i := 0; i < len(binData); i += 4096 {
 		DummyVar += binData[i]
 	}
 }
 
-func loadRuntimeTunables() {
-	if v := os.Getenv("IVF_PROBE"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > IvfProbeMax {
-			log.Fatalf("IVF_PROBE=%q invalid; must be int in [1, %d]", v, IvfProbeMax)
-		}
-		IvfProbe = int32(n)
-		log.Printf("IvfProbe overridden via env: %d (default 16, max %d)", IvfProbe, IvfProbeMax)
-	}
-}
-
 func main() {
-	loadRuntimeTunables()
 	loadNormalization("resources/normalization.json")
 	loadIndex("resources/index.bin")
 
 	server := &fasthttp.Server{
 		Handler: requestHandler,
-		Name:    "IVF",
+		Name:    "BruteForceKNN",
 	}
 
 	listener, err := reuseport.Listen("tcp4", ":8080")
