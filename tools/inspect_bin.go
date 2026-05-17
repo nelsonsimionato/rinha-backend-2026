@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 )
 
 const (
-	Dimensions   = 14
-	RecordStride = 16
-	HeaderSize   = 16
+	Dimensions     = 14
+	RecordStride   = 16
+	HeaderSize     = 16
+	PartitionCount = 256
 )
 
 func main() {
@@ -29,70 +31,122 @@ func main() {
 	}
 
 	ver := raw[0]
-	if ver != 5 {
-		log.Fatalf("unsupported format version %d (expected 5)", ver)
+	if ver != 6 {
+		log.Fatalf("unsupported format version %d (expected 6)", ver)
 	}
-	totalWH := binary.LittleEndian.Uint32(raw[4:8])
-	totalNH := binary.LittleEndian.Uint32(raw[8:12])
-	total := totalWH + totalNH
+	total := binary.LittleEndian.Uint32(raw[4:8])
 
 	expectedSize := int64(HeaderSize) +
-		int64(totalWH)*int64(RecordStride+1) +
-		int64(totalNH)*int64(RecordStride+1)
+		int64(PartitionCount)*8 +
+		int64(total)*int64(RecordStride+1)
 
 	fmt.Printf("file:           %s\n", *path)
 	fmt.Printf("size:           %d bytes (%.2f MB)\n", len(raw), float64(len(raw))/1e6)
 	fmt.Printf("expected size:  %d bytes (matches: %t)\n", expectedSize, int64(len(raw)) == expectedSize)
-	fmt.Printf("format version: %d (brute-force partition)\n", ver)
+	fmt.Printf("format version: %d (feature-hash partition)\n", ver)
 	fmt.Printf("dimensions:     %d (stride %d)\n", Dimensions, RecordStride)
-	fmt.Printf("with_history:   %d (%.2f%%)\n", totalWH, 100.0*float64(totalWH)/float64(total))
-	fmt.Printf("no_history:     %d (%.2f%%)\n", totalNH, 100.0*float64(totalNH)/float64(total))
-	fmt.Printf("total:          %d\n", total)
+	fmt.Printf("partitions:     %d\n", PartitionCount)
+	fmt.Printf("total:          %d records\n", total)
 
 	if int64(len(raw)) != expectedSize {
 		log.Fatalf("size mismatch — abort")
 	}
 
 	off := HeaderSize
-	dataWH := raw[off : off+int(totalWH)*RecordStride]
-	off += int(totalWH) * RecordStride
-	isFraudWH := raw[off : off+int(totalWH)]
-	off += int(totalWH)
-	dataNH := raw[off : off+int(totalNH)*RecordStride]
-	off += int(totalNH) * RecordStride
-	isFraudNH := raw[off : off+int(totalNH)]
+	offsets := make([]uint32, PartitionCount)
+	for i := 0; i < PartitionCount; i++ {
+		offsets[i] = binary.LittleEndian.Uint32(raw[off+i*4 : off+i*4+4])
+	}
+	off += PartitionCount * 4
+	sizes := make([]uint32, PartitionCount)
+	for i := 0; i < PartitionCount; i++ {
+		sizes[i] = binary.LittleEndian.Uint32(raw[off+i*4 : off+i*4+4])
+	}
+	off += PartitionCount * 4
 
-	fraudWH, fraudNH := 0, 0
-	for _, b := range isFraudWH {
-		if b == 1 {
-			fraudWH++
+	minS, maxS, sumS := ^uint32(0), uint32(0), uint32(0)
+	empty := 0
+	for _, s := range sizes {
+		if s < minS {
+			minS = s
+		}
+		if s > maxS {
+			maxS = s
+		}
+		sumS += s
+		if s == 0 {
+			empty++
 		}
 	}
-	for _, b := range isFraudNH {
-		if b == 1 {
-			fraudNH++
-		}
-	}
-	totalFraud := fraudWH + fraudNH
-	fmt.Printf("fraud labels:   %d (%.2f%% overall)\n", totalFraud, 100.0*float64(totalFraud)/float64(total))
-	fmt.Printf("  in WH:        %d (%.2f%% of WH)\n", fraudWH, 100.0*float64(fraudWH)/float64(totalWH))
-	fmt.Printf("  in NH:        %d (%.2f%% of NH)\n", fraudNH, 100.0*float64(fraudNH)/float64(totalNH))
+	avg := sumS / PartitionCount
+	fmt.Printf("partition sizes: avg=%d min=%d max=%d empty=%d (spread max/avg = %.2fx)\n",
+		avg, minS, maxS, empty, float64(maxS)/float64(avg))
 
-	whSentinels := 0
-	for i := 0; i < int(totalWH); i++ {
-		off := i * RecordStride
-		if dataWH[off+5] == 0 || dataWH[off+6] == 0 {
-			whSentinels++
+	type ps struct {
+		idx  int
+		size uint32
+	}
+	sorted := make([]ps, 0, PartitionCount)
+	for i, s := range sizes {
+		sorted = append(sorted, ps{i, s})
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].size > sorted[j].size })
+	fmt.Println("top 5 largest:")
+	for i := 0; i < 5; i++ {
+		fmt.Printf("  partition 0x%02X: %d records\n", sorted[i].idx, sorted[i].size)
+	}
+
+	dataLen := int(total) * RecordStride
+	data := raw[off : off+dataLen]
+	off += dataLen
+	isFraud := raw[off : off+int(total)]
+
+	frauds := 0
+	for _, b := range isFraud {
+		if b == 1 {
+			frauds++
 		}
 	}
-	nhNonSentinels := 0
-	for i := 0; i < int(totalNH); i++ {
-		off := i * RecordStride
-		if dataNH[off+5] != 0 || dataNH[off+6] != 0 {
-			nhNonSentinels++
+	fmt.Printf("fraud labels:   %d (%.2f%%)\n", frauds, 100.0*float64(frauds)/float64(total))
+
+	// Sanity check: recompute partition_key for a sample and compare
+	mismatches := 0
+	checked := 0
+	for partIdx := 0; partIdx < PartitionCount; partIdx++ {
+		start := offsets[partIdx]
+		size := sizes[partIdx]
+		if size == 0 {
+			continue
+		}
+		// check first record of each partition
+		vec := data[start*uint32(RecordStride) : (start+1)*uint32(RecordStride)]
+		recomputed := partitionKey(vec)
+		checked++
+		if int(recomputed) != partIdx {
+			mismatches++
+			if mismatches <= 3 {
+				fmt.Printf("MISMATCH partition 0x%02X first record: recomputed 0x%02X\n", partIdx, recomputed)
+			}
 		}
 	}
-	fmt.Printf("partition integrity:\n")
-	fmt.Printf("  WH with byte 0 at idx 5/6: %d (should be 0)\n", whSentinels)
-	fmt.Printf("  NH with non-0 at idx 5/6:  %d (should be 0)\n", nhNonSentinels)
+	fmt.Printf("integrity check: %d partitions sampled, %d mismatches\n", checked, mismatches)
+}
+
+func partitionKey(vec []uint8) uint8 {
+	var k uint8 = 0
+	if vec[5] == 0 && vec[6] == 0 {
+		k |= 1 << 0
+	}
+	if vec[9] > 128 {
+		k |= 1 << 1
+	}
+	if vec[10] > 128 {
+		k |= 1 << 2
+	}
+	if vec[11] > 128 {
+		k |= 1 << 3
+	}
+	k |= (vec[12] >> 6) << 4
+	k |= (vec[2] >> 6) << 6
+	return k
 }

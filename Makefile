@@ -10,11 +10,12 @@ clean-host:
 generate:
 	go run tools/mccgen.go
 
-# Build the brute-force partition index (format v5) from resources/references.json.gz.
-# Splits records into WH (with-history) and NH (no-history) pools deterministically
-# by the -1 sentinel at idx 5/6. No clustering, no tuning knobs.
-resources/index.bin: resources/references.json.gz tools/build_partition.go
-	go run tools/build_partition.go
+# Build the feature-hash partition index (format v6) from resources/references.json.gz.
+# Splits records into 256 pools by an 8-bit hash of fraud-discriminative dimensions
+# (idx 5,9,10,11,12,2). Runtime brute-force scans matching partition + 8 Hamming-1
+# neighbors per query. Deterministic, no clustering, no tuning knobs.
+resources/index.bin: resources/references.json.gz tools/build_partition_hash.go
+	go run tools/build_partition_hash.go
 
 # Alias for the index-bin file target
 index: resources/index.bin

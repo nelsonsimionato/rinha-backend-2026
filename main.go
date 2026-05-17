@@ -19,10 +19,11 @@ import (
 
 const (
 	Dimensions    = 14 // logical dimensions per vector
-	RecordStride  = 16 // physical bytes per record (padded for AVX2 16-byte loads)
-	K             = 5  // k for k-NN
-	FormatVersion = uint8(5)
-	HeaderSize    = 16
+	RecordStride   = 16 // physical bytes per record (padded for AVX2 16-byte loads)
+	K              = 5  // k for k-NN
+	FormatVersion  = uint8(6)
+	HeaderSize     = 16
+	PartitionCount = 256
 )
 
 // Normalization constants populated from resources/normalization.json at startup.
@@ -36,16 +37,20 @@ var (
 	MaxMerchantAvgAmount = 10000.0
 )
 
-// Partitioned index (format v5): two pools split deterministically by the
-// `-1` sentinel at idx 5/6. A query with vec[5]==0 && vec[6]==0 (no-history)
-// scans NH only; otherwise scans WH only. The sentinel encoding (byte 0)
-// guarantees cross-pool neighbors can never be in the true top-5, so this
-// is exact k-NN within the matching pool (100% recall vs ground truth).
+// Feature-hash partition (format v6): 256 pools indexed by partitionKey(vec),
+// an 8-bit feature hash of fraud-discriminative dimensions (see partitionKey
+// for bit layout). Brute force k=5 within matching partition + 8 single-bit
+// Hamming neighbors (9 partitions probed per query, ~50K records average).
+//
+// Why partition by feature hash instead of K-means: k-means clusters by random
+// feature subset (often hour/MCC); queries land in legit-dominant clusters
+// even when their true neighbors are elsewhere. Feature-hash groups by the
+// dimensions that actually predict fraud, so matching-partition recall is high.
 var (
-	dataWH    []uint8 // N_WH * RecordStride bytes
-	isFraudWH []uint8 // N_WH bytes
-	dataNH    []uint8
-	isFraudNH []uint8
+	data             []uint8           // N * RecordStride bytes, sorted by partition
+	isFraud          []uint8           // N bytes, same order
+	partitionOffsets [PartitionCount]uint32
+	partitionSizes   [PartitionCount]uint32
 )
 
 var (
@@ -97,34 +102,59 @@ type SearchState struct {
 	Q KNNQueue
 }
 
-// scanPool runs a brute-force exact top-K scan over a flat uint8[N*RecordStride]
-// pool. Calls distanceSq (AVX2 on amd64) per pair.
-func scanPool(query *[RecordStride]uint8, pool []uint8, q *KNNQueue) {
-	q.Count = 0
-	n := int32(len(pool) / RecordStride)
+// partitionKey MUST match tools/build_partition_hash.go's encoding exactly.
+// Returns an 8-bit hash of fraud-discriminative dimensions.
+func partitionKey(vec *[RecordStride]uint8) uint8 {
+	var k uint8 = 0
+	if vec[5] == 0 && vec[6] == 0 {
+		k |= 1 << 0
+	}
+	if vec[9] > 128 {
+		k |= 1 << 1
+	}
+	if vec[10] > 128 {
+		k |= 1 << 2
+	}
+	if vec[11] > 128 {
+		k |= 1 << 3
+	}
+	k |= (vec[12] >> 6) << 4
+	k |= (vec[2] >> 6) << 6
+	return k
+}
+
+// scanPartition runs a brute-force exact top-K scan over one partition's
+// contiguous data slice into the global k-NN queue. Records are referenced
+// by absolute index into the global `data` array (so caller can resolve into
+// `isFraud` directly).
+func scanPartition(query *[RecordStride]uint8, partIdx uint8, q *KNNQueue) {
+	start := partitionOffsets[partIdx]
+	size := partitionSizes[partIdx]
+	if size == 0 {
+		return
+	}
 	qPtr := &query[0]
-	for i := int32(0); i < n; i++ {
-		d := distanceSq(qPtr, &pool[i*RecordStride])
-		q.Push(d, i)
+	end := start + size
+	for r := start; r < end; r++ {
+		d := distanceSq(qPtr, &data[uint32(r)*RecordStride])
+		q.Push(d, int32(r))
 	}
 }
 
-// SearchKNN dispatches to the matching pool by inspecting the sentinel bytes
-// and runs an exact brute-force scan there. Returns top-K + the isFraud slice
-// for the pool used (caller looks up isFraudPool[top[i].NodeIdx]).
-func SearchKNN(query *[RecordStride]uint8) (top [K]Neighbor, isFraudPool []uint8) {
+// SearchKNN dispatches to the matching partition plus its 8 single-bit
+// Hamming-neighbor partitions (9 total). Single-bit flips catch records that
+// fall near bucket boundaries on the continuous dimensions (mcc_risk,
+// amount_vs_avg) where small input deltas can flip a partition bit.
+func SearchKNN(query *[RecordStride]uint8) (top [K]Neighbor) {
 	state := searchStatePool.Get().(*SearchState)
+	state.Q.Count = 0
 
-	var pool []uint8
-	if query[5] == 0 && query[6] == 0 {
-		pool = dataNH
-		isFraudPool = isFraudNH
-	} else {
-		pool = dataWH
-		isFraudPool = isFraudWH
+	matchKey := partitionKey(query)
+	scanPartition(query, matchKey, &state.Q)
+	for bit := uint8(0); bit < 8; bit++ {
+		scanPartition(query, matchKey^(1<<bit), &state.Q)
 	}
 
-	scanPool(query, pool, &state.Q)
 	top = state.Q.Items
 	searchStatePool.Put(state)
 	return
@@ -331,11 +361,11 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	vec := vectorize(v)
-	top, isFraudPool := SearchKNN(&vec)
+	top := SearchKNN(&vec)
 
 	fraudCount := 0
 	for i := 0; i < K; i++ {
-		if isFraudPool[top[i].NodeIdx] == 1 {
+		if isFraud[top[i].NodeIdx] == 1 {
 			fraudCount++
 		}
 	}
@@ -398,27 +428,46 @@ func loadIndex(path string) {
 	if ver != FormatVersion {
 		log.Fatalf("index format version %d, expected %d", ver, FormatVersion)
 	}
-	totalWH := binary.LittleEndian.Uint32(binData[4:8])
-	totalNH := binary.LittleEndian.Uint32(binData[8:12])
+	total := binary.LittleEndian.Uint32(binData[4:8])
 
 	off := HeaderSize
-	dataLenWH := int(totalWH) * RecordStride
-	dataLenNH := int(totalNH) * RecordStride
-	expected := off + dataLenWH + int(totalWH) + dataLenNH + int(totalNH)
+	// partitionOffsets
+	for i := 0; i < PartitionCount; i++ {
+		partitionOffsets[i] = binary.LittleEndian.Uint32(binData[off+i*4 : off+i*4+4])
+	}
+	off += PartitionCount * 4
+	// partitionSizes
+	for i := 0; i < PartitionCount; i++ {
+		partitionSizes[i] = binary.LittleEndian.Uint32(binData[off+i*4 : off+i*4+4])
+	}
+	off += PartitionCount * 4
+
+	dataLen := int(total) * RecordStride
+	expected := off + dataLen + int(total)
 	if len(binData) < expected {
 		log.Fatalf("index truncated: %d bytes, expected %d", len(binData), expected)
 	}
 
-	dataWH = binData[off : off+dataLenWH]
-	off += dataLenWH
-	isFraudWH = binData[off : off+int(totalWH)]
-	off += int(totalWH)
-	dataNH = binData[off : off+dataLenNH]
-	off += dataLenNH
-	isFraudNH = binData[off : off+int(totalNH)]
+	data = binData[off : off+dataLen]
+	off += dataLen
+	isFraud = binData[off : off+int(total)]
 
-	log.Printf("loaded index v%d: WH=%d records, NH=%d records, total=%d, %.1f MB",
-		ver, totalWH, totalNH, totalWH+totalNH, float64(len(binData))/1e6)
+	// histogram for log
+	minS, maxS, emptyP := uint32(0xFFFFFFFF), uint32(0), 0
+	for _, s := range partitionSizes {
+		if s < minS {
+			minS = s
+		}
+		if s > maxS {
+			maxS = s
+		}
+		if s == 0 {
+			emptyP++
+		}
+	}
+	log.Printf("loaded index v%d: total=%d records, partitions=%d (avg=%d min=%d max=%d empty=%d), %.1f MB",
+		ver, total, PartitionCount, total/PartitionCount, minS, maxS, emptyP,
+		float64(len(binData))/1e6)
 
 	for i := 0; i < len(binData); i += 4096 {
 		DummyVar += binData[i]
