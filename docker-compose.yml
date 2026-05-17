@@ -1,0 +1,54 @@
+networks:
+    rinha_net:
+      driver: bridge
+
+  services:
+    haproxy:
+      image: haproxy:2.8-alpine
+      volumes:
+        - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      ports:
+        - "9999:9999"
+      deploy:
+        resources:
+          limits:
+            cpus: '0.20'
+            memory: 50M
+      networks:
+        - rinha_net
+      depends_on:
+        api1:
+          condition: service_healthy
+        api2:
+          condition: service_healthy
+
+    api1:
+      image: docker.io/nelsonsimionato/rinha-backend-2026:latest
+      deploy:
+        resources:
+          limits:
+            cpus: '0.40'
+            memory: 150M
+      networks:
+        - rinha_net
+      healthcheck:
+        test: ["CMD", "./healthcheck"]
+        start_period: 10s
+        interval: 5s
+        timeout: 3s
+        retries: 20
+
+    api2:
+      image: docker.io/nelsonsimionato/rinha-backend-2026:latest
+      deploy:
+        resources:
+          limits:
+            cpus: '0.40'
+            memory: 150M
+      networks:
+        - rinha_net
+      healthcheck:
+        test: ["CMD", "./healthcheck"]
+        start_period: 10s
+        interval: 5s
+        timeout: 3s
