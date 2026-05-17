@@ -23,7 +23,7 @@ services:
         condition: service_healthy
 
   api1:
-    image: docker.io/nelsonsimionato/rinha-backend-2026:latest
+    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.2-bruteforce
     deploy:
       resources:
         limits:
@@ -39,7 +39,7 @@ services:
       retries: 20
 
   api2:
-    image: docker.io/nelsonsimionato/rinha-backend-2026:latest
+    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.2-bruteforce
     deploy:
       resources:
         limits:
