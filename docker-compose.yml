@@ -9,11 +9,11 @@ services:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
       - "9999:9999"
-    # 10 ms CFS period (vs the default 100 ms) caps any single throttling
-    # window at 10 ms. Crushes the long p99 tail without changing capacity.
-    cpu_period: 10000
-    cpu_quota:  1000   # 0.10 cpu
-    mem_limit:  30M
+    deploy:
+      resources:
+        limits:
+          cpus: '0.10'
+          memory: 30M
     networks:
       - rinha_net
     depends_on:
@@ -21,12 +21,18 @@ services:
         condition: service_healthy
       api2:
         condition: service_healthy
+      api3:
+        condition: service_healthy
+      api4:
+        condition: service_healthy
 
   api1: &api
     image: docker.io/nelsonsimionato/rinha-backend-2026:v0.13-c-rewrite
-    cpu_period: 10000
-    cpu_quota:  4500   # 0.45 cpu
-    mem_limit:  160M
+    deploy:
+      resources:
+        limits:
+          cpus: '0.225'
+          memory: 80M
     networks:
       - rinha_net
     healthcheck:
@@ -37,4 +43,10 @@ services:
       retries: 20
 
   api2:
+    <<: *api
+
+  api3:
+    <<: *api
+
+  api4:
     <<: *api
