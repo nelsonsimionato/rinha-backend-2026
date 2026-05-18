@@ -27,7 +27,7 @@ services:
         condition: service_healthy
 
   api1: &api
-    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.6-part4k-4inst
+    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.7-boundprune
     deploy:
       resources:
         limits:
