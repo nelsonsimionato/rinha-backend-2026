@@ -1,0 +1,42 @@
+networks:
+  rinha_net:
+    driver: bridge
+
+services:
+  lb:
+    image: haproxy:2.8-alpine
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "9999:9999"
+    # 10 ms CFS period (vs default 100 ms) caps any single throttle window at
+    # 10 ms, keeping the p99 tail under control.
+    cpu_period: 10000
+    cpu_quota:  1000   # 0.10 cpu
+    mem_limit:  30M
+    networks:
+      - rinha_net
+    depends_on:
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+
+  api1: &api
+    build:
+      context: ..              # project root so we can COPY resources/index.bin
+      dockerfile: c-impl/Dockerfile
+    cpu_period: 10000
+    cpu_quota:  4500   # 0.45 cpu
+    mem_limit:  160M
+    networks:
+      - rinha_net
+    healthcheck:
+      test: ["CMD", "/api", "--healthcheck"]
+      start_period: 10s
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api2:
+    <<: *api
