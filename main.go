@@ -21,9 +21,9 @@ const (
 	Dimensions    = 14 // logical dimensions per vector
 	RecordStride   = 16 // physical bytes per record (padded for AVX2 16-byte loads)
 	K              = 5  // k for k-NN
-	FormatVersion  = uint8(9)
+	FormatVersion  = uint8(10)
 	HeaderSize     = 16
-	PartitionCount = 4096
+	PartitionCount = 8192
 )
 
 // Normalization constants populated from resources/normalization.json at startup.
@@ -51,30 +51,17 @@ var (
 	isFraud          []uint8 // N bytes, same order
 	partitionOffsets [PartitionCount]uint32
 	partitionSizes   [PartitionCount]uint32
-	// Axis-aligned bounding boxes per partition (min/max byte per dim).
-	// Used by lowerBoundDistSq for partition-level pruning.
-	partitionMin []uint8 // PartitionCount * RecordStride bytes
-	partitionMax []uint8
 )
 
 var (
 	parserPool fastjson.ParserPool
 
 	searchStatePool = sync.Pool{
-		New: func() interface{} {
-			return &SearchState{
-				cands: make([]candidate, 0, PartitionCount),
-			}
-		},
+		New: func() interface{} { return &SearchState{} },
 	}
 
 	DummyVar byte
 )
-
-type candidate struct {
-	bound uint32
-	idx   uint16
-}
 
 // Response bodies indexed by fraudCount ∈ [0..K]. Six total: K+1.
 var responseBodies = [K + 1]string{
@@ -112,12 +99,11 @@ func (q *KNNQueue) Push(distSq uint32, nodeIdx int32) {
 }
 
 type SearchState struct {
-	Q     KNNQueue
-	cands []candidate
+	Q KNNQueue
 }
 
 // partitionKey MUST match tools/build_partition_hash.go's encoding exactly.
-// Returns a 12-bit hash of fraud-discriminative dimensions (range [0, 4095]).
+// Returns a 13-bit hash of fraud-discriminative dimensions (range [0, 8191]).
 func partitionKey(vec *[RecordStride]uint8) uint16 {
 	var k uint16 = 0
 	if vec[5] == 0 && vec[6] == 0 {
@@ -146,6 +132,9 @@ func partitionKey(vec *[RecordStride]uint8) uint16 {
 	if vec[3] > 128 {
 		k |= 1 << 11
 	}
+	if vec[4] > 128 {
+		k |= 1 << 12
+	}
 	return k
 }
 
@@ -165,99 +154,24 @@ func scanPartition(query *[RecordStride]uint8, partIdx uint16, q *KNNQueue) {
 	}
 }
 
-// lowerBoundDistSq returns the minimum possible squared Euclidean distance
-// from query to ANY record in partition `partIdx`. Computed against the
-// partition's axis-aligned bounding box: for each dim, if query is outside
-// [min, max] of that dim within the partition, the distance contribution is
-// (closest-edge - query)^2; otherwise 0 (query falls within the partition's
-// range for this dim).
-//
-// If this lower bound exceeds the current K-th nearest neighbor's distance,
-// no record in this partition can possibly improve the top-K → safe to skip.
-func lowerBoundDistSq(query *[RecordStride]uint8, partIdx uint16) uint32 {
-	base := uint32(partIdx) * RecordStride
-	var sum uint32
-	// Unrolled over 14 logical dims; bytes 14/15 are zero in query AND
-	// in partitionMin/Max (records are zero-padded), so their contribution is 0.
-	for d := 0; d < Dimensions; d++ {
-		q := int32(query[d])
-		mn := int32(partitionMin[base+uint32(d)])
-		mx := int32(partitionMax[base+uint32(d)])
-		switch {
-		case q < mn:
-			diff := mn - q
-			sum += uint32(diff * diff)
-		case q > mx:
-			diff := q - mx
-			sum += uint32(diff * diff)
-		}
-	}
-	return sum
-}
-
-// SearchKNN runs bound-pruned exact k-NN:
-//   1. Scan the matching partition (seeds the top-K queue)
-//   2. For every other partition: compute lower-bound distance; skip if
-//      already worse than top-K's current worst
-//   3. Sort surviving candidates by their lower bound ascending
-//   4. Iterate in sorted order; stop as soon as bound >= current top-K worst
-//
-// Result: recall 100% by construction (vs ~98.6% with adaptive Hamming probe),
-// with adaptive scan size — typical queries probe just a handful of partitions.
+// SearchKNN: scan matching partition. If matching has < K records (empty/sparse),
+// expand to the 13 single-bit Hamming neighbor partitions to fill out top-K.
+// Adaptive probe trades ~5% recall on bucket-boundary queries for ~10x throughput.
 func SearchKNN(query *[RecordStride]uint8) (top [K]Neighbor) {
 	state := searchStatePool.Get().(*SearchState)
 	state.Q.Count = 0
-	state.cands = state.cands[:0]
 
 	matchKey := partitionKey(query)
 	scanPartition(query, matchKey, &state.Q)
-
-	// Compute lower bounds for all other partitions; filter by current top-K worst.
-	var worstDist uint32 = ^uint32(0)
-	if state.Q.Count >= K {
-		worstDist = state.Q.Items[K-1].DistSq
-	}
-	for i := uint16(0); i < PartitionCount; i++ {
-		if i == matchKey || partitionSizes[i] == 0 {
-			continue
+	if state.Q.Count < K {
+		for bit := uint16(0); bit < 13; bit++ {
+			scanPartition(query, matchKey^(1<<bit), &state.Q)
 		}
-		b := lowerBoundDistSq(query, i)
-		if b < worstDist {
-			state.cands = append(state.cands, candidate{bound: b, idx: i})
-		}
-	}
-
-	// Sort candidates ascending by bound (small partial sort via stdlib is OK;
-	// typical count is 50–500 after filter, costing tens of µs).
-	if len(state.cands) > 1 {
-		sortCandidates(state.cands)
-	}
-
-	// Iterate; break as soon as bound exceeds current top-K worst.
-	for _, c := range state.cands {
-		if state.Q.Count >= K && c.bound >= state.Q.Items[K-1].DistSq {
-			break
-		}
-		scanPartition(query, c.idx, &state.Q)
 	}
 
 	top = state.Q.Items
 	searchStatePool.Put(state)
 	return
-}
-
-// sortCandidates: insertion sort. Good for the typical n ≤ 500 case (cheaper
-// than reflect-based sort.Slice and zero alloc).
-func sortCandidates(c []candidate) {
-	for i := 1; i < len(c); i++ {
-		x := c[i]
-		j := i - 1
-		for j >= 0 && c[j].bound > x.bound {
-			c[j+1] = c[j]
-			j--
-		}
-		c[j+1] = x
-	}
 }
 
 // clampQuantize MUST match tools/build_partition.go's encoding.
@@ -541,12 +455,6 @@ func loadIndex(path string) {
 		partitionSizes[i] = binary.LittleEndian.Uint32(binData[off+i*4 : off+i*4+4])
 	}
 	off += PartitionCount * 4
-	// partitionMin (bounding boxes)
-	boxLen := PartitionCount * RecordStride
-	partitionMin = binData[off : off+boxLen]
-	off += boxLen
-	partitionMax = binData[off : off+boxLen]
-	off += boxLen
 
 	dataLen := int(total) * RecordStride
 	expected := off + dataLen + int(total)
