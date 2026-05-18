@@ -15,7 +15,7 @@ const (
 	Dimensions     = 14
 	RecordStride   = 16
 	HeaderSize     = 16
-	PartitionCount = 1024
+	PartitionCount = 4096
 )
 
 func main() {
@@ -31,8 +31,8 @@ func main() {
 	}
 
 	ver := raw[0]
-	if ver != 7 {
-		log.Fatalf("unsupported format version %d (expected 7)", ver)
+	if ver != 8 {
+		log.Fatalf("unsupported format version %d (expected 8)", ver)
 	}
 	total := binary.LittleEndian.Uint32(raw[4:8])
 
@@ -153,6 +153,12 @@ func partitionKey(vec []uint8) uint16 {
 	}
 	if vec[8] > 128 {
 		k |= 1 << 9
+	}
+	if vec[0] > 128 {
+		k |= 1 << 10
+	}
+	if vec[3] > 128 {
+		k |= 1 << 11
 	}
 	return k
 }

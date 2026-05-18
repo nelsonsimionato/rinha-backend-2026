@@ -40,7 +40,7 @@ ENV GOMAXPROCS=1
 # Heap is dominated by the 45 MB read-only index. Memory pressure is low, so
 # we can afford to GC less often.
 ENV GOGC=200
-ENV GOMEMLIMIT=140MiB
+ENV GOMEMLIMIT=65MiB
 
 EXPOSE 9999
 CMD ["./api"]

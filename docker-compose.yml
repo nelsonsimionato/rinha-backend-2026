@@ -12,8 +12,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.20'
-          memory: 50M
+          cpus: '0.10'
+          memory: 30M
     networks:
       - rinha_net
     depends_on:
@@ -21,14 +21,18 @@ services:
         condition: service_healthy
       api2:
         condition: service_healthy
+      api3:
+        condition: service_healthy
+      api4:
+        condition: service_healthy
 
-  api1:
+  api1: &api
     build: .
     deploy:
       resources:
         limits:
-          cpus: '0.40'
-          memory: 150M
+          cpus: '0.225'
+          memory: 80M
     networks:
       - rinha_net
     healthcheck:
@@ -40,17 +44,10 @@ services:
       retries: 20
 
   api2:
-    build: .
-    deploy:
-      resources:
-        limits:
-          cpus: '0.40'
-          memory: 150M
-    networks:
-      - rinha_net
-    healthcheck:
-      test: ["CMD", "./healthcheck"]
-      start_period: 10s
-      interval: 5s
-      timeout: 3s
-      retries: 20
+    <<: *api
+
+  api3:
+    <<: *api
+
+  api4:
+    <<: *api

@@ -14,9 +14,9 @@ import (
 const (
 	Dimensions     = 14
 	RecordStride   = 16
-	FormatVersion  = uint8(7)
+	FormatVersion  = uint8(8)
 	HeaderSize     = 16
-	PartitionCount = 1024
+	PartitionCount = 4096
 )
 
 // Binary format v7 (feature-hash partition, 1024 buckets):
@@ -54,11 +54,9 @@ func clampQuantize(x float64) uint8 {
 // Must match runtime's partitionKey in main.go byte-for-byte.
 func partitionKey(vec []uint8) uint16 {
 	var k uint16 = 0
-	// bit 0: no_history sentinel (both idx 5 and 6 == 0)
 	if vec[5] == 0 && vec[6] == 0 {
 		k |= 1 << 0
 	}
-	// bits 1..3: binary dims (>128 means "true" after clampQuantize(1.0)=255)
 	if vec[9] > 128 {
 		k |= 1 << 1
 	}
@@ -68,17 +66,21 @@ func partitionKey(vec []uint8) uint16 {
 	if vec[11] > 128 {
 		k |= 1 << 3
 	}
-	// bits 4-5: mcc_risk in {0,1,2,3}
 	k |= uint16(vec[12]>>6) << 4
-	// bits 6-7: amount_vs_avg in {0,1,2,3}
 	k |= uint16(vec[2]>>6) << 6
-	// bit 8: km_from_home > 0.5 of max_km (byte > 128)
 	if vec[7] > 128 {
 		k |= 1 << 8
 	}
-	// bit 9: tx_count_24h > 0.5 of max (byte > 128)
 	if vec[8] > 128 {
 		k |= 1 << 9
+	}
+	// bit 10: amount > 0.5 of max_amount (dim 0, byte > 128) — high spending splits legit clusters
+	if vec[0] > 128 {
+		k |= 1 << 10
+	}
+	// bit 11: hour_of_day > 12 (dim 3, byte > 128) — afternoon/night vs morning
+	if vec[3] > 128 {
+		k |= 1 << 11
 	}
 	return k
 }

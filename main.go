@@ -21,9 +21,9 @@ const (
 	Dimensions    = 14 // logical dimensions per vector
 	RecordStride   = 16 // physical bytes per record (padded for AVX2 16-byte loads)
 	K              = 5  // k for k-NN
-	FormatVersion  = uint8(7)
+	FormatVersion  = uint8(8)
 	HeaderSize     = 16
-	PartitionCount = 1024
+	PartitionCount = 4096
 )
 
 // Normalization constants populated from resources/normalization.json at startup.
@@ -103,7 +103,7 @@ type SearchState struct {
 }
 
 // partitionKey MUST match tools/build_partition_hash.go's encoding exactly.
-// Returns a 10-bit hash of fraud-discriminative dimensions (range [0, 1023]).
+// Returns a 12-bit hash of fraud-discriminative dimensions (range [0, 4095]).
 func partitionKey(vec *[RecordStride]uint8) uint16 {
 	var k uint16 = 0
 	if vec[5] == 0 && vec[6] == 0 {
@@ -125,6 +125,12 @@ func partitionKey(vec *[RecordStride]uint8) uint16 {
 	}
 	if vec[8] > 128 {
 		k |= 1 << 9
+	}
+	if vec[0] > 128 {
+		k |= 1 << 10
+	}
+	if vec[3] > 128 {
+		k |= 1 << 11
 	}
 	return k
 }
@@ -159,7 +165,7 @@ func SearchKNN(query *[RecordStride]uint8) (top [K]Neighbor) {
 	matchKey := partitionKey(query)
 	scanPartition(query, matchKey, &state.Q)
 	if state.Q.Count < K {
-		for bit := uint16(0); bit < 10; bit++ {
+		for bit := uint16(0); bit < 12; bit++ {
 			scanPartition(query, matchKey^(1<<bit), &state.Q)
 		}
 	}
