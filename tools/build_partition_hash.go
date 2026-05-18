@@ -14,7 +14,7 @@ import (
 const (
 	Dimensions     = 14
 	RecordStride   = 16
-	FormatVersion  = uint8(8)
+	FormatVersion  = uint8(9)
 	HeaderSize     = 16
 	PartitionCount = 4096
 )
@@ -173,6 +173,46 @@ func main() {
 		cursor[r.key]++
 	}
 
+	// Compute axis-aligned bounding box (min, max) per partition.
+	// Used at query time by lowerBoundDistSq() to prune partitions whose closest
+	// possible record is already farther than the current top-K worst.
+	// Empty partitions get min=255, max=0 → naturally produce huge bounds → always skipped.
+	partitionMin := make([]uint8, PartitionCount*RecordStride)
+	partitionMax := make([]uint8, PartitionCount*RecordStride)
+	for p := uint32(0); p < PartitionCount; p++ {
+		size := sizes[p]
+		base := p * uint32(RecordStride)
+		if size == 0 {
+			for d := 0; d < RecordStride; d++ {
+				partitionMin[base+uint32(d)] = 255
+				partitionMax[base+uint32(d)] = 0
+			}
+			continue
+		}
+		start := offsets[p]
+		// Init from first record
+		for d := 0; d < RecordStride; d++ {
+			v := sortedData[start*uint32(RecordStride)+uint32(d)]
+			partitionMin[base+uint32(d)] = v
+			partitionMax[base+uint32(d)] = v
+		}
+		// Update from remaining records
+		for r := uint32(1); r < size; r++ {
+			recBase := (start + r) * uint32(RecordStride)
+			for d := 0; d < RecordStride; d++ {
+				v := sortedData[recBase+uint32(d)]
+				if v < partitionMin[base+uint32(d)] {
+					partitionMin[base+uint32(d)] = v
+				}
+				if v > partitionMax[base+uint32(d)] {
+					partitionMax[base+uint32(d)] = v
+				}
+			}
+		}
+	}
+	log.Printf("computed bounding boxes for %d partitions (%d KB)",
+		PartitionCount, PartitionCount*RecordStride*2/1024)
+
 	out, err := os.Create("resources/index.bin")
 	if err != nil {
 		log.Fatalf("create index.bin: %v", err)
@@ -191,6 +231,12 @@ func main() {
 	if err := binary.Write(out, binary.LittleEndian, sizes[:]); err != nil {
 		log.Fatal(err)
 	}
+	if _, err := out.Write(partitionMin); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := out.Write(partitionMax); err != nil {
+		log.Fatal(err)
+	}
 	if _, err := out.Write(sortedData); err != nil {
 		log.Fatal(err)
 	}
@@ -198,7 +244,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	expected := int64(HeaderSize) + int64(PartitionCount)*8 + int64(N)*int64(RecordStride+1)
+	expected := int64(HeaderSize) +
+		int64(PartitionCount)*8 + // offsets + sizes
+		int64(PartitionCount)*int64(RecordStride)*2 + // min + max
+		int64(N)*int64(RecordStride+1)
 	if stat, err := out.Stat(); err == nil {
 		log.Printf("wrote index.bin: %d bytes (%.1f MB, expected %d)",
 			stat.Size(), float64(stat.Size())/1e6, expected)
