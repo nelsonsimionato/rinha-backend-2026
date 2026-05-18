@@ -11,8 +11,21 @@ package main
 //go:noescape
 func distanceSqAvx(query, ref *byte) uint32
 
+// boundDistSqAvx returns the squared lower-bound Euclidean distance from query
+// to a partition's axis-aligned bounding box (partMin/partMax). Used to prune
+// partitions that cannot possibly contain a closer neighbor than the current
+// top-K worst.
+//
+//go:noescape
+func boundDistSqAvx(query, partMin, partMax *byte) uint32
+
 // distanceSq is the production entry point. On amd64 it calls the AVX2 path;
 // distance_other.go provides the pure-Go fallback for non-amd64.
 func distanceSq(query, ref *byte) uint32 {
 	return distanceSqAvx(query, ref)
+}
+
+// boundDistSq is the production entry point for partition lower-bound distance.
+func boundDistSq(query, partMin, partMax *byte) uint32 {
+	return boundDistSqAvx(query, partMin, partMax)
 }

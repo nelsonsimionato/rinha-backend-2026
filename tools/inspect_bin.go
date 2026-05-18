@@ -15,7 +15,7 @@ const (
 	Dimensions     = 14
 	RecordStride   = 16
 	HeaderSize     = 16
-	PartitionCount = 8192
+	PartitionCount = 16384
 )
 
 func main() {
@@ -31,13 +31,14 @@ func main() {
 	}
 
 	ver := raw[0]
-	if ver != 10 {
-		log.Fatalf("unsupported format version %d (expected 10)", ver)
+	if ver != 11 {
+		log.Fatalf("unsupported format version %d (expected 11)", ver)
 	}
 	total := binary.LittleEndian.Uint32(raw[4:8])
 
 	expectedSize := int64(HeaderSize) +
 		int64(PartitionCount)*8 + // offsets + sizes
+		int64(PartitionCount)*int64(RecordStride)*2 + // bounding boxes
 		int64(total)*int64(RecordStride+1)
 
 	fmt.Printf("file:           %s\n", *path)
@@ -93,8 +94,11 @@ func main() {
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].size > sorted[j].size })
 	fmt.Println("top 5 largest:")
 	for i := 0; i < 5; i++ {
-		fmt.Printf("  partition 0x%03X: %d records\n", sorted[i].idx, sorted[i].size)
+		fmt.Printf("  partition 0x%04X: %d records\n", sorted[i].idx, sorted[i].size)
 	}
+
+	// Skip bounding boxes (min + max)
+	off += PartitionCount * RecordStride * 2
 
 	dataLen := int(total) * RecordStride
 	data := raw[off : off+dataLen]
@@ -162,6 +166,9 @@ func partitionKey(vec []uint8) uint16 {
 	}
 	if vec[4] > 128 {
 		k |= 1 << 12
+	}
+	if vec[13] > 128 {
+		k |= 1 << 13
 	}
 	return k
 }

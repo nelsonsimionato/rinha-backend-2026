@@ -2,46 +2,75 @@
 
 // func distanceSqAvx(query, ref *byte) uint32
 //
-// Computes the squared Euclidean distance between two 16-byte uint8 vectors.
-// Bytes 14 and 15 of both query and ref must be 0 (padding) so they contribute
-// nothing to the sum.
-//
-// Algorithm:
-//   |q - r| = max(q,r) - min(q,r)             (unsigned abs diff)
-//   square each byte by zero-extending to words and pmaddwd
-//   horizontal-sum 8 dwords -> 1 uint32
-//
-// On Haswell: ~10 cycles per call, dominated by vpmaddwd + horizontal sum.
+// Squared Euclidean distance between two 16-byte uint8 vectors.
+// Bytes 14 and 15 of both query and ref must be 0 (padding).
 TEXT ·distanceSqAvx(SB), NOSPLIT, $0-20
 	MOVQ query+0(FP), AX
 	MOVQ ref+8(FP), BX
 
-	// 16-byte unaligned loads
 	VMOVDQU (AX), X0
 	VMOVDQU (BX), X1
 
-	// abs diff = max - min (unsigned)
-	VPMINUB X1, X0, X2  // X2 = min(X0, X1)
-	VPMAXUB X1, X0, X3  // X3 = max(X0, X1)
-	VPSUBB  X2, X3, X4  // X4 = |q - r|, 16 bytes
+	VPMINUB X1, X0, X2
+	VPMAXUB X1, X0, X3
+	VPSUBB  X2, X3, X4
 
-	// zero-extend bytes to 16-bit words: 16 bytes (xmm) -> 16 words (ymm)
 	VPMOVZXBW X4, Y5
-
-	// pmaddwd: result[i] = (Y5[2i] * Y5[2i]) + (Y5[2i+1] * Y5[2i+1])
-	// 8 dwords, sum = total squared distance.
 	VPMADDWD Y5, Y5, Y6
 
-	// horizontal sum: 8 dwords -> 1 uint32
-	VEXTRACTI128 $1, Y6, X7   // X7 = high 4 dwords of Y6
-	VPADDD X6, X7, X8         // X8 = [a+e, b+f, c+g, d+h]
-	VPSHUFD $0x4E, X8, X9     // X9 = [c+g, d+h, a+e, b+f] (swap halves)
-	VPADDD X8, X9, X8         // X8 lower 2 dwords: [a+e+c+g, b+f+d+h, ...]
-	VPSHUFD $0xB1, X8, X9     // X9 = [b+f+d+h, a+e+c+g, ...] (swap adjacent)
-	VPADDD X8, X9, X8         // X8 low dword: sum
-	VMOVD X8, AX              // AX = sum
+	VEXTRACTI128 $1, Y6, X7
+	VPADDD X6, X7, X8
+	VPSHUFD $0x4E, X8, X9
+	VPADDD X8, X9, X8
+	VPSHUFD $0xB1, X8, X9
+	VPADDD X8, X9, X8
+	VMOVD X8, AX
 
 	VZEROUPPER
 
 	MOVL AX, ret+16(FP)
+	RET
+
+// func boundDistSqAvx(query, partMin, partMax *byte) uint32
+//
+// Squared lower-bound distance from query to a partition's axis-aligned
+// bounding box. For each dim:
+//   if query[d] < partMin[d]: contribution = (partMin[d] - query[d])²
+//   if query[d] > partMax[d]: contribution = (query[d] - partMax[d])²
+//   else:                      contribution = 0
+//
+// Uses VPSUBUSB (unsigned saturating subtract) to compute both
+// "max(0, partMin - query)" and "max(0, query - partMax)" in parallel,
+// then OR via VPMAXUB (only one can be non-zero per byte).
+TEXT ·boundDistSqAvx(SB), NOSPLIT, $0-28
+	MOVQ query+0(FP), AX
+	MOVQ partMin+8(FP), BX
+	MOVQ partMax+16(FP), CX
+
+	VMOVDQU (AX), X0    // query
+	VMOVDQU (BX), X1    // partMin
+	VMOVDQU (CX), X2    // partMax
+
+	// X3 = max(0, partMin - query): non-zero where query < partMin
+	VPSUBUSB X0, X1, X3
+	// X4 = max(0, query - partMax): non-zero where query > partMax
+	VPSUBUSB X2, X0, X4
+	// X5 = per-byte edge distance (only one of X3[d], X4[d] is non-zero)
+	VPMAXUB X3, X4, X5
+
+	// Square: zero-extend to words, pmaddwd, horizontal sum
+	VPMOVZXBW X5, Y6
+	VPMADDWD Y6, Y6, Y7
+
+	VEXTRACTI128 $1, Y7, X8
+	VPADDD X7, X8, X7
+	VPSHUFD $0x4E, X7, X8
+	VPADDD X7, X8, X7
+	VPSHUFD $0xB1, X7, X8
+	VPADDD X7, X8, X7
+	VMOVD X7, AX
+
+	VZEROUPPER
+
+	MOVL AX, ret+24(FP)
 	RET

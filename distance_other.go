@@ -16,3 +16,25 @@ func distanceSq(query, ref *byte) uint32 {
 	}
 	return sum
 }
+
+// boundDistSq is the non-amd64 fallback for partition lower-bound distance.
+func boundDistSq(query, partMin, partMax *byte) uint32 {
+	q := (*[16]uint8)(unsafe.Pointer(query))
+	mn := (*[16]uint8)(unsafe.Pointer(partMin))
+	mx := (*[16]uint8)(unsafe.Pointer(partMax))
+	var sum uint32
+	for i := 0; i < 16; i++ {
+		qi := int32(q[i])
+		mni := int32(mn[i])
+		mxi := int32(mx[i])
+		var d int32
+		switch {
+		case qi < mni:
+			d = mni - qi
+		case qi > mxi:
+			d = qi - mxi
+		}
+		sum += uint32(d * d)
+	}
+	return sum
+}

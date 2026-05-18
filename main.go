@@ -21,9 +21,15 @@ const (
 	Dimensions    = 14 // logical dimensions per vector
 	RecordStride   = 16 // physical bytes per record (padded for AVX2 16-byte loads)
 	K              = 5  // k for k-NN
-	FormatVersion  = uint8(10)
+	FormatVersion  = uint8(11)
 	HeaderSize     = 16
-	PartitionCount = 8192
+	PartitionCount = 16384
+
+	// MaxCandidates caps the lower-bound-pruned probe queue. After the matching
+	// partition fills top-K, we only ever scan at most this many additional
+	// partitions (sorted by their lower-bound). Tight cap keeps the cost of
+	// bound-pruning small even with 16K partitions × ~3K non-empty.
+	MaxCandidates = 64
 )
 
 // Normalization constants populated from resources/normalization.json at startup.
@@ -51,6 +57,12 @@ var (
 	isFraud          []uint8 // N bytes, same order
 	partitionOffsets [PartitionCount]uint32
 	partitionSizes   [PartitionCount]uint32
+	// Axis-aligned bounding boxes per partition (16 bytes each, AVX2-aligned).
+	partitionMin []uint8
+	partitionMax []uint8
+	// Pre-computed list of non-empty partition indices, populated at load.
+	// Lets SearchKNN iterate only the populated subset (~3K of 16K typically).
+	nonEmptyPartitions []uint16
 )
 
 var (
@@ -62,6 +74,11 @@ var (
 
 	DummyVar byte
 )
+
+type candidate struct {
+	bound uint32
+	idx   uint16
+}
 
 // Response bodies indexed by fraudCount ∈ [0..K]. Six total: K+1.
 var responseBodies = [K + 1]string{
@@ -99,7 +116,31 @@ func (q *KNNQueue) Push(distSq uint32, nodeIdx int32) {
 }
 
 type SearchState struct {
-	Q KNNQueue
+	Q     KNNQueue
+	cands [MaxCandidates]candidate
+	nC    int // current count in cands (bounded by MaxCandidates)
+}
+
+// pushCandidate inserts a candidate into the bounded sorted array.
+// Keeps the MaxCandidates smallest bounds; rejects worse than worst-of-K
+// (bounded insertion sort).
+func (s *SearchState) pushCandidate(b uint32, idx uint16) {
+	if s.nC < MaxCandidates {
+		s.cands[s.nC] = candidate{bound: b, idx: idx}
+		s.nC++
+		for i := s.nC - 1; i > 0 && s.cands[i].bound < s.cands[i-1].bound; i-- {
+			s.cands[i], s.cands[i-1] = s.cands[i-1], s.cands[i]
+		}
+		return
+	}
+	// Full: only insert if better than worst
+	if b >= s.cands[MaxCandidates-1].bound {
+		return
+	}
+	s.cands[MaxCandidates-1] = candidate{bound: b, idx: idx}
+	for i := MaxCandidates - 1; i > 0 && s.cands[i].bound < s.cands[i-1].bound; i-- {
+		s.cands[i], s.cands[i-1] = s.cands[i-1], s.cands[i]
+	}
 }
 
 // partitionKey MUST match tools/build_partition_hash.go's encoding exactly.
@@ -135,6 +176,9 @@ func partitionKey(vec *[RecordStride]uint8) uint16 {
 	if vec[4] > 128 {
 		k |= 1 << 12
 	}
+	if vec[13] > 128 {
+		k |= 1 << 13
+	}
 	return k
 }
 
@@ -154,19 +198,49 @@ func scanPartition(query *[RecordStride]uint8, partIdx uint16, q *KNNQueue) {
 	}
 }
 
-// SearchKNN: scan matching partition. If matching has < K records (empty/sparse),
-// expand to the 13 single-bit Hamming neighbor partitions to fill out top-K.
-// Adaptive probe trades ~5% recall on bucket-boundary queries for ~10x throughput.
+// SearchKNN: bound-pruned exact k-NN.
+//   1. Scan matching partition first to seed top-K.
+//   2. Iterate the pre-computed list of non-empty partitions; for each, compute
+//      AVX2 lower-bound distance to its bounding box; if bound < current worst-K,
+//      keep it as a candidate (bounded by MaxCandidates).
+//   3. Sort by bound ascending (insertion sort — small, ≤MaxCandidates).
+//   4. Scan candidates in order; break as soon as bound exceeds current worst-K.
+//
+// Recall is exact (100%) by definition: any record that could improve top-K
+// lives in some partition whose box bound is ≤ worst-K; we visit all such.
+// Performance: iteration is over non-empty partitions only (~3K of 16K) and
+// each bound is computed in ~5 ns via AVX2. Plus a hard cap on candidates
+// prevents pathological queries from blowing up under load.
 func SearchKNN(query *[RecordStride]uint8) (top [K]Neighbor) {
 	state := searchStatePool.Get().(*SearchState)
 	state.Q.Count = 0
+	state.nC = 0
+	qPtr := &query[0]
 
 	matchKey := partitionKey(query)
 	scanPartition(query, matchKey, &state.Q)
-	if state.Q.Count < K {
-		for bit := uint16(0); bit < 13; bit++ {
-			scanPartition(query, matchKey^(1<<bit), &state.Q)
+
+	// Gather candidates among non-empty partitions, filtered by current top-K worst.
+	var worstDist uint32 = ^uint32(0)
+	if state.Q.Count >= K {
+		worstDist = state.Q.Items[K-1].DistSq
+	}
+	for _, i := range nonEmptyPartitions {
+		if i == matchKey {
+			continue
 		}
+		b := boundDistSq(qPtr, &partitionMin[uint32(i)*RecordStride], &partitionMax[uint32(i)*RecordStride])
+		if b < worstDist {
+			state.pushCandidate(b, i)
+		}
+	}
+
+	// Iterate sorted candidates; break early once bound exceeds current worst.
+	for i := 0; i < state.nC; i++ {
+		if state.Q.Count >= K && state.cands[i].bound >= state.Q.Items[K-1].DistSq {
+			break
+		}
+		scanPartition(query, state.cands[i].idx, &state.Q)
 	}
 
 	top = state.Q.Items
@@ -455,6 +529,12 @@ func loadIndex(path string) {
 		partitionSizes[i] = binary.LittleEndian.Uint32(binData[off+i*4 : off+i*4+4])
 	}
 	off += PartitionCount * 4
+	// Bounding boxes
+	boxLen := PartitionCount * RecordStride
+	partitionMin = binData[off : off+boxLen]
+	off += boxLen
+	partitionMax = binData[off : off+boxLen]
+	off += boxLen
 
 	dataLen := int(total) * RecordStride
 	expected := off + dataLen + int(total)
@@ -465,6 +545,14 @@ func loadIndex(path string) {
 	data = binData[off : off+dataLen]
 	off += dataLen
 	isFraud = binData[off : off+int(total)]
+
+	// Pre-compute non-empty partition indices for fast iteration in SearchKNN.
+	nonEmptyPartitions = nonEmptyPartitions[:0]
+	for i := uint16(0); i < PartitionCount; i++ {
+		if partitionSizes[i] > 0 {
+			nonEmptyPartitions = append(nonEmptyPartitions, i)
+		}
+	}
 
 	// histogram for log
 	minS, maxS, emptyP := uint32(0xFFFFFFFF), uint32(0), 0

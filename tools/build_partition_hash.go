@@ -14,9 +14,9 @@ import (
 const (
 	Dimensions     = 14
 	RecordStride   = 16
-	FormatVersion  = uint8(10)
+	FormatVersion  = uint8(11)
 	HeaderSize     = 16
-	PartitionCount = 8192
+	PartitionCount = 16384
 )
 
 // Binary format v7 (feature-hash partition, 1024 buckets):
@@ -83,9 +83,13 @@ func partitionKey(vec []uint8) uint16 {
 		k |= 1 << 11
 	}
 	// bit 12: day_of_week > 3 (dim 4, byte > 128) — Thu/Fri/Sat/Sun vs Mon/Tue/Wed
-	// Splits remaining huge legit partitions (0x804/0x814) along a weekly axis
 	if vec[4] > 128 {
 		k |= 1 << 12
+	}
+	// bit 13: merchant_avg_amount > 0.5 (dim 13, byte > 128) — merchant tier (premium vs everyday)
+	// Splits ~50/50 in real data → halves the largest partitions
+	if vec[13] > 128 {
+		k |= 1 << 13
 	}
 	return k
 }
@@ -178,6 +182,42 @@ func main() {
 		cursor[r.key]++
 	}
 
+	// Axis-aligned bounding box (min, max) per partition for bound-pruning at query time.
+	partitionMin := make([]uint8, PartitionCount*RecordStride)
+	partitionMax := make([]uint8, PartitionCount*RecordStride)
+	for p := uint32(0); p < PartitionCount; p++ {
+		size := sizes[p]
+		base := p * uint32(RecordStride)
+		if size == 0 {
+			// Empty: min=255 max=0 → any lower-bound computes to a huge number → skipped at runtime
+			for d := 0; d < RecordStride; d++ {
+				partitionMin[base+uint32(d)] = 255
+				partitionMax[base+uint32(d)] = 0
+			}
+			continue
+		}
+		start := offsets[p]
+		for d := 0; d < RecordStride; d++ {
+			v := sortedData[start*uint32(RecordStride)+uint32(d)]
+			partitionMin[base+uint32(d)] = v
+			partitionMax[base+uint32(d)] = v
+		}
+		for r := uint32(1); r < size; r++ {
+			recBase := (start + r) * uint32(RecordStride)
+			for d := 0; d < RecordStride; d++ {
+				v := sortedData[recBase+uint32(d)]
+				if v < partitionMin[base+uint32(d)] {
+					partitionMin[base+uint32(d)] = v
+				}
+				if v > partitionMax[base+uint32(d)] {
+					partitionMax[base+uint32(d)] = v
+				}
+			}
+		}
+	}
+	log.Printf("computed bounding boxes for %d partitions (%d KB)",
+		PartitionCount, PartitionCount*RecordStride*2/1024)
+
 	out, err := os.Create("resources/index.bin")
 	if err != nil {
 		log.Fatalf("create index.bin: %v", err)
@@ -196,6 +236,12 @@ func main() {
 	if err := binary.Write(out, binary.LittleEndian, sizes[:]); err != nil {
 		log.Fatal(err)
 	}
+	if _, err := out.Write(partitionMin); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := out.Write(partitionMax); err != nil {
+		log.Fatal(err)
+	}
 	if _, err := out.Write(sortedData); err != nil {
 		log.Fatal(err)
 	}
@@ -205,6 +251,7 @@ func main() {
 
 	expected := int64(HeaderSize) +
 		int64(PartitionCount)*8 + // offsets + sizes
+		int64(PartitionCount)*int64(RecordStride)*2 + // min + max boxes
 		int64(N)*int64(RecordStride+1)
 	if stat, err := out.Stat(); err == nil {
 		log.Printf("wrote index.bin: %d bytes (%.1f MB, expected %d)",
