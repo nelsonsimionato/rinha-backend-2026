@@ -12,7 +12,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.10'
+          cpus: '0.50'
           memory: 30M
     networks:
       - rinha_net
@@ -22,15 +22,16 @@ services:
       api2:
         condition: service_healthy
 
-  # Phase 2: i16 index (~118 MB) no longer fits 4×80 MB → 2 fat instances.
-  # Budget: 2×0.45 + 0.10 = 1.0 CPU, 2×160 + 30 = 350 MB. Each API holds the
-  # full index (no sharding); haproxy round-robins.
+  # v0.16: CPU rebalanced to the LB. Diagnosis showed the p99 was HAProxy
+  # throttling at 0.10 CPU while the APIs sat idle (~0.01 CPU used of 0.45).
+  # Budget: 0.50 (haproxy) + 2×0.25 (api) = 1.0 CPU, 30 + 2×160 = 350 MB.
+  # Each API holds the full i16 index (no sharding); haproxy round-robins.
   api1: &api
     image: docker.io/nelsonsimionato/rinha-backend-2026:v0.15-i16
     deploy:
       resources:
         limits:
-          cpus: '0.45'
+          cpus: '0.25'
           memory: 160M
     networks:
       - rinha_net
