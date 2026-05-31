@@ -37,21 +37,21 @@ typedef struct {
 
 #define KNOWN_MERCHANTS_CAP 16
 
-/* Quantize a float to byte using Go's clampQuantize encoding:
- *   x < 0  → 0      (sentinel for missing / -1)
- *   x>1    → 255
- *   else   → round(x*254) + 1   (so 0.0 → 1, 1.0 → 255)
- * The 0-byte sentinel must NOT be produced by normalized values.
- * Uses banker-free rounding (round half away from zero) to match math.Round. */
-uint8_t clamp_quantize(double x);
+/* Quantize a float to int16 (scale I16_SCALE=5000), matching the builder
+ * (tools/build_kdtree.go quantizeI16) bit-for-bit:
+ *   x < 0  → I16_SENTINEL (-5000)   (null last_transaction / missing)
+ *   x > 1  → 5000
+ *   else   → round(x*5000)          (0.0 → 0, 1.0 → 5000)
+ * Round half away from zero (lround) to match Go math.Round. */
+int16_t quantize_i16(double x);
 
 /* Per-MCC risk lookup (matches resources/mcc_risk.json values; default 0.5). */
 double mcc_risk(int mcc);
 
-/* Convert a decoded Payload into a 16-byte vector (bytes 14/15 zero pad).
- * Output byte layout is the SAME as Go v0.12's vectorize() — verified by
- * test_vectorize.c against canonical legit/fraud payloads. */
-void vectorize_payload(const Payload *p, uint8_t out_vec[RECORD_STRIDE]);
+/* Convert a decoded Payload into a 16-lane int16 vector (lanes 14/15 zero pad).
+ * Output layout matches the index builder — verified by test_vectorize.c
+ * against the canonical legit/fraud payloads. */
+void vectorize_payload(const Payload *p, int16_t out_vec[RECORD_STRIDE]);
 
 /* Normalization constants — overridable at startup by reading
  * resources/normalization.json. */

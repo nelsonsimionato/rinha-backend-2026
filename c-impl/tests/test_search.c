@@ -78,7 +78,7 @@ int main(int argc, char **argv)
 
 	{
 		Payload p; fill_canonical_fraud(&p);
-		uint8_t v[16]; vectorize_payload(&p, v);
+		int16_t v[16]; vectorize_payload(&p, v);
 		search_knn(v, &st, neigh);
 		int fraud = count_fraud(neigh);
 		printf("[canonical-fraud] fraud_count=%d/5 → fraud_score=%.4f\n", fraud, fraud / 5.0);
@@ -86,7 +86,7 @@ int main(int argc, char **argv)
 	}
 	{
 		Payload p; fill_canonical_legit(&p);
-		uint8_t v[16]; vectorize_payload(&p, v);
+		int16_t v[16]; vectorize_payload(&p, v);
 		search_knn(v, &st, neigh);
 		int fraud = count_fraud(neigh);
 		printf("[canonical-legit] fraud_count=%d/5 → fraud_score=%.4f\n", fraud, fraud / 5.0);

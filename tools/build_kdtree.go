@@ -1,26 +1,25 @@
 //go:build ignore
 
-// build_kdtree.go — Phase 1 index builder.
+// build_kdtree.go — Phase 2 index builder (KD-tree over i16, scale 5000).
 //
-// Replaces the skewed 14-bit feature-hash partition (tools/build_partition_hash.go)
-// with a balanced, EXACT KD-tree over the uint8-quantized 16-byte vectors.
+// Balanced, EXACT KD-tree over the int16-quantized 16-lane vectors.
 // Sliding-midpoint split on the widest-spread dimension (median fallback on
 // degenerate splits), leaf size 32. Each node stores its subtree AABB so the
-// C runtime prunes with the existing AVX2 bound_dist_sq kernel.
+// C runtime prunes with the AVX2 bound_dist_sq kernel.
 //
-// On-disk format v12 (little-endian):
-//   [0]       uint8  formatVersion = 12
+// On-disk format v13 (little-endian):
+//   [0]       uint8  formatVersion = 13
 //   [1:4]     reserved
 //   [4:8]     uint32 N            (total records)
 //   [8:12]    uint32 nodeCount
 //   [12:16]   reserved
-//   [16:..]   nodes[nodeCount] × KDNode (40 bytes):
-//                 [0:16]  bmin[16] uint8   (subtree AABB min; dims 14,15 = 0)
-//                 [16:32] bmax[16] uint8
-//                 [32:36] uint32 a         internal: left child idx ; leaf: first record idx
-//                 [36:40] uint32 b         internal: right child idx (<2^31)
+//   [16:..]   nodes[nodeCount] × KDNode (72 bytes):
+//                 [0:32]  bmin[16] int16   (subtree AABB min; lanes 14,15 = 0)
+//                 [32:64] bmax[16] int16
+//                 [64:68] uint32 a         internal: left child idx ; leaf: first record idx
+//                 [68:72] uint32 b         internal: right child idx (<2^31)
 //                                          leaf:     count | 0x80000000
-//   [..]      data[N][16] uint8  (reordered into KD leaf order)
+//   [..]      data[N][16] int16  (reordered into KD leaf order)
 //   [..]      isFraud[N]  uint8  (same order)
 //
 // Build:  go run tools/build_kdtree.go      (reads resources/references.json.gz,
@@ -39,28 +38,31 @@ import (
 
 const (
 	Dimensions    = 14
-	RecordStride  = 16
-	FormatVersion = uint8(12)
+	RecordStride  = 16 // i16 lanes per record (14 dims + 2 zero pad)
+	FormatVersion = uint8(13)
 	HeaderSize    = 16
 	LeafSize      = 32
-	NodeBytes     = 40
+	NodeBytes     = 72
+	I16Scale      = 5000
+	I16Sentinel   = int16(-5000)
 	LeafFlag      = uint32(0x80000000)
 	CountMask     = uint32(0x7fffffff)
 )
 
-func clampQuantize(x float64) uint8 {
+// quantizeI16 must match the runtime quantize_i16 (vectorize.c) bit-for-bit.
+func quantizeI16(x float64) int16 {
 	if x < 0.0 {
-		return 0
+		return I16Sentinel // null/missing (float -1) -> -5000
 	}
 	if x > 1.0 {
-		return 255
+		return I16Scale
 	}
-	return uint8(math.Round(x*254.0)) + 1
+	return int16(math.Round(x * float64(I16Scale)))
 }
 
 // Flat point store. pts[i*16 .. i*16+16] is record i (original order).
 var (
-	pts   []uint8
+	pts   []int16
 	fraud []uint8
 	idx   []int32 // permutation, reordered during build into leaf order
 
@@ -69,15 +71,15 @@ var (
 )
 
 type kdNode struct {
-	bmin  [RecordStride]uint8
-	bmax  [RecordStride]uint8
-	a, b  uint32
+	bmin [RecordStride]int16
+	bmax [RecordStride]int16
+	a, b uint32
 }
 
-func computeBox(lo, hi int) (bmin, bmax [RecordStride]uint8) {
+func computeBox(lo, hi int) (bmin, bmax [RecordStride]int16) {
 	for d := 0; d < RecordStride; d++ {
-		bmin[d] = 255
-		bmax[d] = 0
+		bmin[d] = math.MaxInt16
+		bmax[d] = math.MinInt16
 	}
 	for i := lo; i < hi; i++ {
 		base := int(idx[i]) * RecordStride
@@ -112,7 +114,7 @@ func build(lo, hi, depth int) int32 {
 		return ni
 	}
 
-	// widest-spread dimension (dims 14,15 are constant 0 → never chosen)
+	// widest-spread dimension (lanes 14,15 are constant 0 -> never chosen)
 	dim, spread := 0, -1
 	for d := 0; d < Dimensions; d++ {
 		s := int(bmax[d]) - int(bmin[d])
@@ -121,7 +123,7 @@ func build(lo, hi, depth int) int32 {
 		}
 	}
 	// sliding-midpoint split value
-	mid := uint8((int(bmin[dim]) + int(bmax[dim])) / 2)
+	mid := int16((int(bmin[dim]) + int(bmax[dim])) / 2)
 
 	// in-place partition: idx[lo:m] have dim <= mid, idx[m:hi] have dim > mid
 	i := lo
@@ -133,8 +135,9 @@ func build(lo, hi, depth int) int32 {
 	}
 	m := i
 	if m == lo || m == hi {
-		// degenerate (all points on one side of the midpoint, e.g. many ties):
-		// fall back to a balanced median split on this dim so both children are non-empty.
+		// degenerate (e.g. many ties): balanced median split so both children
+		// are non-empty. Box correctness (not the split value) is what the
+		// runtime pruning relies on, so any non-trivial split is exact.
 		sub := idx[lo:hi]
 		sort.Slice(sub, func(x, y int) bool {
 			return pts[int(sub[x])*RecordStride+dim] < pts[int(sub[y])*RecordStride+dim]
@@ -166,7 +169,7 @@ func main() {
 		log.Fatalf("expected JSON array open: %v", err)
 	}
 	N := 0
-	pts = make([]uint8, 0, 3_000_000*RecordStride)
+	pts = make([]int16, 0, 3_000_000*RecordStride)
 	fraud = make([]uint8, 0, 3_000_000)
 	for dec.More() {
 		var row struct {
@@ -176,11 +179,11 @@ func main() {
 		if err := dec.Decode(&row); err != nil {
 			log.Fatalf("decode record %d: %v", N, err)
 		}
-		var vec [RecordStride]uint8
+		var vec [RecordStride]int16
 		for d := 0; d < Dimensions; d++ {
-			vec[d] = clampQuantize(float64(row.Vector[d]))
+			vec[d] = quantizeI16(float64(row.Vector[d]))
 		}
-		// bytes 14,15 stay 0 (AVX2 padding contract)
+		// lanes 14,15 stay 0 (AVX2 padding contract)
 		pts = append(pts, vec[:]...)
 		var f uint8
 		if row.Label == "fraud" {
@@ -215,7 +218,7 @@ func main() {
 		len(nodes), leaves, maxDepth, float64(sumLeaf)/float64(leaves), maxLeaf)
 
 	// reorder data + isFraud into leaf order (idx permutation)
-	sortedData := make([]uint8, N*RecordStride)
+	sortedData := make([]int16, N*RecordStride)
 	sortedFraud := make([]uint8, N)
 	for p := 0; p < N; p++ {
 		src := int(idx[p]) * RecordStride
@@ -235,21 +238,29 @@ func main() {
 	binary.LittleEndian.PutUint32(header[8:12], uint32(len(nodes)))
 	mustWrite(out, header[:])
 
-	// nodes
+	// nodes (72 bytes each: 16 i16 bmin, 16 i16 bmax, u32 a, u32 b — all LE)
 	nodeBuf := make([]byte, len(nodes)*NodeBytes)
 	for i, nd := range nodes {
 		o := i * NodeBytes
-		copy(nodeBuf[o:o+RecordStride], nd.bmin[:])
-		copy(nodeBuf[o+RecordStride:o+2*RecordStride], nd.bmax[:])
-		binary.LittleEndian.PutUint32(nodeBuf[o+32:o+36], nd.a)
-		binary.LittleEndian.PutUint32(nodeBuf[o+36:o+40], nd.b)
+		for d := 0; d < RecordStride; d++ {
+			binary.LittleEndian.PutUint16(nodeBuf[o+d*2:], uint16(nd.bmin[d]))
+			binary.LittleEndian.PutUint16(nodeBuf[o+32+d*2:], uint16(nd.bmax[d]))
+		}
+		binary.LittleEndian.PutUint32(nodeBuf[o+64:o+68], nd.a)
+		binary.LittleEndian.PutUint32(nodeBuf[o+68:o+72], nd.b)
 	}
 	mustWrite(out, nodeBuf)
-	mustWrite(out, sortedData)
+
+	// data (N*16 int16, LE)
+	dataBuf := make([]byte, N*RecordStride*2)
+	for i, v := range sortedData {
+		binary.LittleEndian.PutUint16(dataBuf[i*2:], uint16(v))
+	}
+	mustWrite(out, dataBuf)
 	mustWrite(out, sortedFraud)
 
 	expected := int64(HeaderSize) + int64(len(nodes))*NodeBytes +
-		int64(N)*int64(RecordStride+1)
+		int64(N)*int64(RecordStride)*2 + int64(N)
 	if stat, err := out.Stat(); err == nil {
 		log.Printf("wrote index.bin: %d bytes (%.1f MB, expected %d)",
 			stat.Size(), float64(stat.Size())/1e6, expected)

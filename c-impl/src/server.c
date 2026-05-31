@@ -103,7 +103,7 @@ static void handle_request(Conn *c, HttpRequest *req)
 		return;
 	}
 
-	uint8_t vec[RECORD_STRIDE];
+	int16_t vec[RECORD_STRIDE];
 	vectorize_payload(&p, vec);
 
 	SearchState st;

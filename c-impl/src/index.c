@@ -9,7 +9,7 @@
 
 const KDNode  *kd_nodes;
 uint32_t       kd_node_count;
-const uint8_t *data;
+const int16_t *data;
 const uint8_t *is_fraud;
 uint32_t       total_records;
 
@@ -64,13 +64,13 @@ int index_load(const char *path)
 	kd_nodes = (const KDNode *)(buf + off);
 	off += (size_t)nnodes * KD_NODE_BYTES;
 
-	size_t data_len = (size_t)total * RECORD_STRIDE;
+	size_t data_len = (size_t)total * RECORD_STRIDE * sizeof(int16_t);
 	size_t expected = off + data_len + total;
 	if (size < expected) {
 		fprintf(stderr, "index_load: truncated (%zu bytes, expected %zu)\n", size, expected);
 		return -1;
 	}
-	data     = buf + off;
+	data     = (const int16_t *)(buf + off);
 	off     += data_len;
 	is_fraud = buf + off;
 

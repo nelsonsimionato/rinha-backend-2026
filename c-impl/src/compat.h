@@ -14,16 +14,23 @@
 
 /* Vector geometry — must match the index builder (tools/build_kdtree.go). */
 #define DIMENSIONS        14
-#define RECORD_STRIDE     16
+#define RECORD_STRIDE     16          /* i16 lanes/record (14 dims + 2 zero pad) = 32 bytes, one ymm */
 #define K                 5
-#define FORMAT_VERSION    12          /* v12: balanced KD-tree (Phase 1) */
+#define FORMAT_VERSION    13          /* v13: KD-tree over i16 (Phase 2) */
 #define HEADER_SIZE       16
 
-/* KD-tree (format v12). Node = 40 bytes: bmin[16] bmax[16] a(u32) b(u32).
+/* i16 quantization (scale 5000). [0,1] -> [0,5000]; null last_transaction
+ * (float -1) -> I16_SENTINEL. Lossless for the 5-NN decision (measured 0
+ * errors/6000 vs the float oracle) and overflow-safe: worst dist_sq = 5e8 <<
+ * INT32_MAX (one ymm holds 16 i16; vpmaddwd pairs stay < 2e8 per i32 lane). */
+#define I16_SCALE         5000
+#define I16_SENTINEL      (-5000)
+
+/* KD-tree (format v13). Node = 72 bytes: bmin[16]i16 bmax[16]i16 a(u32) b(u32).
  * Leaf iff (b & KD_LEAF_FLAG): a = first record idx, count = b & KD_COUNT_MASK.
  * Internal: a = left child idx, b = right child idx (< 2^31). */
 #define LEAF_SIZE         32
-#define KD_NODE_BYTES     40
+#define KD_NODE_BYTES     72
 #define KD_LEAF_FLAG      0x80000000u
 #define KD_COUNT_MASK     0x7fffffffu
 /* Traversal stack depth: ample headroom over the builder's reported max depth. */

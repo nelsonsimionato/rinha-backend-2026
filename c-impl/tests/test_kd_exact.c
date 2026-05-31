@@ -16,7 +16,7 @@
 #include "../src/search.h"
 #include "../src/distance.h"
 
-static void brute_top5(const uint8_t *q, uint32_t dists[K], int fraud_out[1])
+static void brute_top5(const int16_t *q, uint32_t dists[K], int fraud_out[1])
 {
 	uint32_t best[K]; int32_t bidx[K]; int cnt = 0;
 	uint32_t n = total_records;
@@ -54,17 +54,17 @@ int main(int argc, char **argv)
 
 	for (int t = 0; t < Q; t++) {
 		uint32_t row = (uint32_t)(((unsigned long)rand()*1103515245UL + rand()) % n);
-		uint8_t q[RECORD_STRIDE];
-		memcpy(q, &data[(size_t)row * RECORD_STRIDE], RECORD_STRIDE);
-		/* Perturb half the queries by ±a few quant levels on a couple of dims so
-		 * they are not exact record matches (exercises real pruning paths). */
+		int16_t q[RECORD_STRIDE];
+		memcpy(q, &data[(size_t)row * RECORD_STRIDE], RECORD_STRIDE * sizeof(int16_t));
+		/* Perturb half the queries by ±a few hundred i16 levels on a couple of dims
+		 * so they are not exact record matches (exercises real pruning paths). */
 		if (t & 1) {
 			for (int d = 0; d < 6; d++) {
 				int dim = (row + d*7) % DIMENSIONS;
-				int delta = ((int)((row >> d) & 7)) - 3;     /* -3..+4 */
+				int delta = (((int)((row >> d) & 7)) - 3) * 100;   /* -300..+400 */
 				int v = (int)q[dim] + delta;
-				if (v < 0) v = 0; if (v > 255) v = 255;
-				q[dim] = (uint8_t)v;
+				if (v < -5000) v = -5000; if (v > 5000) v = 5000;
+				q[dim] = (int16_t)v;
 			}
 		}
 

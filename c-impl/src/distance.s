@@ -1,12 +1,13 @@
-/* AVX2 squared Euclidean distance routines.
+/* AVX2 squared Euclidean distance routines — i16 (Phase 2, format v13).
  *
- * Port of distance_amd64.s (Plan 9 / Go assembler) → GAS for C linkage.
- * Both functions: 16-byte unaligned input vectors, byte-level operations,
- * sum-of-squares via PMADDWD + horizontal sum. Result in EAX.
+ * Vectors are 16 int16 lanes (14 real dims + 2 zero pad) = 32 bytes = one ymm.
+ * Values are in [-5000, 5000] (I16_SCALE=5000; sentinel -5000), so per-lane
+ * diff is in [-10000, 10000] (fits i16), diff^2 <= 1e8, vpmaddwd pair-sum
+ * <= 2e8 per i32 lane, full 8-lane sum <= 5e8 < INT32_MAX. Result in EAX.
  *
- * Calling convention: System V AMD64 ABI.
- *   distance_sq(q, ref): %rdi = q, %rsi = ref
- *   bound_dist_sq(q, min, max): %rdi = q, %rsi = min, %rdx = max
+ * System V AMD64 ABI.
+ *   distance_sq(q, ref):            %rdi=q, %rsi=ref
+ *   bound_dist_sq(q, min, max):     %rdi=q, %rsi=min, %rdx=max
  */
 
 .section .text
@@ -14,23 +15,18 @@
 .globl distance_sq
 .type  distance_sq, @function
 distance_sq:
-	vmovdqu  (%rdi), %xmm0
-	vmovdqu  (%rsi), %xmm1
+	vmovdqu  (%rdi), %ymm0          /* q   : 16 i16 */
+	vmovdqu  (%rsi), %ymm1          /* ref : 16 i16 */
+	vpsubw   %ymm1, %ymm0, %ymm2    /* diff = q - ref (signed) */
+	vpmaddwd %ymm2, %ymm2, %ymm3    /* 8 i32: diff[2i]^2 + diff[2i+1]^2 */
 
-	vpminub  %xmm1, %xmm0, %xmm2
-	vpmaxub  %xmm1, %xmm0, %xmm3
-	vpsubb   %xmm2, %xmm3, %xmm4
-
-	vpmovzxbw %xmm4, %ymm5
-	vpmaddwd  %ymm5, %ymm5, %ymm6
-
-	vextracti128 $1, %ymm6, %xmm7
-	vpaddd   %xmm7, %xmm6, %xmm6
-	vpshufd  $0x4e, %xmm6, %xmm7
-	vpaddd   %xmm7, %xmm6, %xmm6
-	vpshufd  $0xb1, %xmm6, %xmm7
-	vpaddd   %xmm7, %xmm6, %xmm6
-	vmovd    %xmm6, %eax
+	vextracti128 $1, %ymm3, %xmm4
+	vpaddd   %xmm4, %xmm3, %xmm3
+	vpshufd  $0x4e, %xmm3, %xmm4
+	vpaddd   %xmm4, %xmm3, %xmm3
+	vpshufd  $0xb1, %xmm3, %xmm4
+	vpaddd   %xmm4, %xmm3, %xmm3
+	vmovd    %xmm3, %eax
 	vzeroupper
 	ret
 .size distance_sq, .-distance_sq
@@ -39,19 +35,16 @@ distance_sq:
 .globl bound_dist_sq
 .type  bound_dist_sq, @function
 bound_dist_sq:
-	vmovdqu  (%rdi), %xmm0       /* query */
-	vmovdqu  (%rsi), %xmm1       /* min_box */
-	vmovdqu  (%rdx), %xmm2       /* max_box */
+	vmovdqu  (%rdi), %ymm0          /* query   */
+	vmovdqu  (%rsi), %ymm1          /* min_box */
+	vmovdqu  (%rdx), %ymm2          /* max_box */
 
-	/* xmm3 = max(0, min_box - query) per byte */
-	vpsubusb %xmm0, %xmm1, %xmm3
-	/* xmm4 = max(0, query - max_box) per byte */
-	vpsubusb %xmm2, %xmm0, %xmm4
-	/* xmm5 = per-byte edge distance (only one of xmm3[d], xmm4[d] is non-zero) */
-	vpmaxub  %xmm3, %xmm4, %xmm5
-
-	vpmovzxbw %xmm5, %ymm6
-	vpmaddwd  %ymm6, %ymm6, %ymm7
+	vpsubw   %ymm0, %ymm1, %ymm3    /* min - q  (>0 when q < min)        */
+	vpsubw   %ymm2, %ymm0, %ymm4    /* q - max  (>0 when q > max)        */
+	vpmaxsw  %ymm4, %ymm3, %ymm5    /* per-lane max(min-q, q-max)        */
+	vpxor    %ymm6, %ymm6, %ymm6
+	vpmaxsw  %ymm6, %ymm5, %ymm5    /* clamp negatives (inside box) to 0 */
+	vpmaddwd %ymm5, %ymm5, %ymm7    /* edge^2, paired into 8 i32         */
 
 	vextracti128 $1, %ymm7, %xmm8
 	vpaddd   %xmm8, %xmm7, %xmm7

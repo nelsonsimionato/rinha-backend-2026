@@ -60,7 +60,7 @@ static int run_case(const char *name, const char *json, int min_fraud, int max_f
 		fprintf(stderr, "[%s] json_parse FAILED\n", name);
 		return 1;
 	}
-	uint8_t v[16];
+	int16_t v[16];
 	vectorize_payload(&p, v);
 
 	SearchState st;

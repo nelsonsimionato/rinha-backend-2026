@@ -2,6 +2,9 @@ networks:
   rinha_net:
     driver: bridge
 
+# Phase 2 topology: 2 API instances (i16 index is ~118 MB, no longer fits the
+# 4×80 MB layout). Budget: 2×0.45 + 0.10 = 1.0 CPU, 2×160 + 30 = 350 MB.
+# Each API holds the full index (no sharding); the LB round-robins.
 services:
   haproxy:
     image: haproxy:2.8-alpine
@@ -21,33 +24,26 @@ services:
         condition: service_healthy
       api2:
         condition: service_healthy
-      api3:
-        condition: service_healthy
-      api4:
-        condition: service_healthy
 
   api1: &api
-    build: .
+    build:
+      context: .
+      dockerfile: c-impl/Dockerfile   # C impl; root Dockerfile is the legacy Go build
     deploy:
       resources:
         limits:
-          cpus: '0.225'
-          memory: 80M
+          cpus: '0.45'
+          memory: 160M
     networks:
       - rinha_net
     healthcheck:
-      test: ["CMD", "./healthcheck"]
-      # Cold start spans the 51 MB index mmap + pre-warm loop (one byte per 4KB page).
-      start_period: 10s
+      # C image: self-probe via the built-in healthcheck mode.
+      test: ["CMD", "/api", "--healthcheck"]
+      # Cold start spans the 118 MB i16 index mmap + pre-warm loop (one byte / 4KB page).
+      start_period: 12s
       interval: 5s
       timeout: 3s
       retries: 20
 
   api2:
-    <<: *api
-
-  api3:
-    <<: *api
-
-  api4:
     <<: *api

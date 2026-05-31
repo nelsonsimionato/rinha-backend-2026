@@ -27,7 +27,7 @@ ALWAYS_INLINE void knn_push(SearchState *st, uint32_t d, int32_t idx)
 #define PREFETCH_AHEAD 8
 
 /* Scan a leaf's [start, start+count) records into the top-K queue. */
-ALWAYS_INLINE void scan_leaf(const uint8_t *query, uint32_t start, uint32_t count,
+ALWAYS_INLINE void scan_leaf(const int16_t *query, uint32_t start, uint32_t count,
                              SearchState *st)
 {
 	uint32_t end = start + count;
@@ -51,7 +51,7 @@ ALWAYS_INLINE void scan_leaf(const uint8_t *query, uint32_t start, uint32_t coun
  * child whose bounding box is nearer first (tightens the K-th distance early),
  * and prune a node when its box lower-bound is already >= the current K-th.
  * The stack holds at most the tree height (<< KD_STACK_SIZE). */
-void search_knn(const uint8_t query[RECORD_STRIDE], SearchState *st,
+void search_knn(const int16_t query[RECORD_STRIDE], SearchState *st,
                 Neighbor out[K])
 {
 	st->q_count = 0;

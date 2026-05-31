@@ -1,18 +1,18 @@
-/* Validates vectorize_payload() byte-for-byte against the canonical examples
- * from docs/DETECTION_RULES.md, the same payloads the Go port already verifies
- * in main_vectorize_test.go. */
+/* Validates vectorize_payload() against the canonical examples from
+ * docs/DETECTION_RULES.md, now in i16 (scale 5000). Null last_transaction
+ * yields the I16_SENTINEL (-5000) at lanes 5,6; lanes 14,15 are zero pad. */
 
 #include <stdio.h>
 #include <string.h>
 #include "../src/vectorize.h"
 
-static int check_vec(const char *name, const uint8_t got[16], const uint8_t want[16])
+static int check_vec(const char *name, const int16_t got[16], const int16_t want[16])
 {
 	int mismatches = 0;
 	for (int i = 0; i < 16; i++) {
 		if (got[i] != want[i]) {
 			if (mismatches++ < 4) {
-				fprintf(stderr, "[%s] vec[%d] got=%u want=%u\n", name, i, got[i], want[i]);
+				fprintf(stderr, "[%s] vec[%d] got=%d want=%d\n", name, i, got[i], want[i]);
 			}
 		}
 	}
@@ -56,25 +56,25 @@ static int test_canonical_legit(void)
 	memcpy(p.known_merchants,      km,      sizeof(km));
 	memcpy(p.known_merchants_lens, km_lens, sizeof(km_lens));
 
-	uint8_t got[16];
+	int16_t got[16];
 	vectorize_payload(&p, got);
 
-	uint8_t want[16] = {
-		clamp_quantize(41.12 / 10000),                /* 0 */
-		clamp_quantize(2.0 / 12),                     /* 1 */
-		clamp_quantize((41.12 / 82.24) / 10),         /* 2 */
-		clamp_quantize(18.0 / 23),                    /* 3 */
-		clamp_quantize(2.0 / 6),                      /* 4: Wed = 2 */
-		0,                                            /* 5: sentinel */
-		0,                                            /* 6: sentinel */
-		clamp_quantize(29.23 / 1000),                 /* 7 */
-		clamp_quantize(3.0 / 20),                     /* 8 */
-		clamp_quantize(0.0),                          /* 9: is_online=false */
-		clamp_quantize(1.0),                          /* 10: card_present=true */
-		clamp_quantize(0.0),                          /* 11: MERC-016 known */
-		clamp_quantize(mcc_risk(5411)),               /* 12 */
-		clamp_quantize(60.25 / 10000),                /* 13 */
-		0, 0,                                          /* 14, 15: padding */
+	int16_t want[16] = {
+		quantize_i16(41.12 / 10000),                /* 0 */
+		quantize_i16(2.0 / 12),                     /* 1 */
+		quantize_i16((41.12 / 82.24) / 10),         /* 2 */
+		quantize_i16(18.0 / 23),                    /* 3 */
+		quantize_i16(2.0 / 6),                      /* 4: Wed = 2 */
+		I16_SENTINEL,                               /* 5: sentinel */
+		I16_SENTINEL,                               /* 6: sentinel */
+		quantize_i16(29.23 / 1000),                 /* 7 */
+		quantize_i16(3.0 / 20),                      /* 8 */
+		quantize_i16(0.0),                          /* 9: is_online=false */
+		quantize_i16(1.0),                          /* 10: card_present=true */
+		quantize_i16(0.0),                          /* 11: MERC-016 known */
+		quantize_i16(mcc_risk(5411)),               /* 12 */
+		quantize_i16(60.25 / 10000),                /* 13 */
+		0, 0,                                        /* 14, 15: padding */
 	};
 
 	return check_vec("canonical-legit", got, want);
@@ -112,23 +112,23 @@ static int test_canonical_fraud(void)
 	memcpy(p.known_merchants,      km,      sizeof(km));
 	memcpy(p.known_merchants_lens, km_lens, sizeof(km_lens));
 
-	uint8_t got[16];
+	int16_t got[16];
 	vectorize_payload(&p, got);
 
-	uint8_t want[16] = {
-		clamp_quantize(9505.97 / 10000),
-		clamp_quantize(10.0 / 12),
-		clamp_quantize((9505.97 / 81.28) / 10),       /* clamps to 1.0 */
-		clamp_quantize(5.0 / 23),                     /* hour 05 */
-		clamp_quantize(5.0 / 6),                      /* Sat = 5 */
-		0, 0,
-		clamp_quantize(952.27 / 1000),
-		clamp_quantize(20.0 / 20),                    /* clamps to 1.0 */
-		clamp_quantize(0.0),
-		clamp_quantize(1.0),
-		clamp_quantize(1.0),                          /* unknown merchant */
-		clamp_quantize(mcc_risk(7802)),
-		clamp_quantize(54.86 / 10000),
+	int16_t want[16] = {
+		quantize_i16(9505.97 / 10000),
+		quantize_i16(10.0 / 12),
+		quantize_i16((9505.97 / 81.28) / 10),       /* clamps to 1.0 */
+		quantize_i16(5.0 / 23),                     /* hour 05 */
+		quantize_i16(5.0 / 6),                      /* Sat = 5 */
+		I16_SENTINEL, I16_SENTINEL,
+		quantize_i16(952.27 / 1000),
+		quantize_i16(20.0 / 20),                    /* clamps to 1.0 */
+		quantize_i16(0.0),
+		quantize_i16(1.0),
+		quantize_i16(1.0),                          /* unknown merchant */
+		quantize_i16(mcc_risk(7802)),
+		quantize_i16(54.86 / 10000),
 		0, 0,
 	};
 
@@ -165,24 +165,24 @@ static int test_legit_with_history(void)
 	memcpy(p.known_merchants,      km,      sizeof(km));
 	memcpy(p.known_merchants_lens, km_lens, sizeof(km_lens));
 
-	uint8_t got[16];
+	int16_t got[16];
 	vectorize_payload(&p, got);
 
-	uint8_t want[16] = {
-		clamp_quantize(87.50 / 10000),
-		clamp_quantize(1.0 / 12),
-		clamp_quantize((87.50 / 95.30) / 10),
-		clamp_quantize(14.0 / 23),
-		clamp_quantize(6.0 / 6),                      /* Sun = 6 */
-		clamp_quantize(158.0 / 1440),                 /* minutes between */
-		clamp_quantize(0.8 / 1000),
-		clamp_quantize(3.2 / 1000),
-		clamp_quantize(5.0 / 20),
-		clamp_quantize(0.0),
-		clamp_quantize(1.0),
-		clamp_quantize(0.0),                          /* MERC-005 is known */
-		clamp_quantize(mcc_risk(5411)),
-		clamp_quantize(102.45 / 10000),
+	int16_t want[16] = {
+		quantize_i16(87.50 / 10000),
+		quantize_i16(1.0 / 12),
+		quantize_i16((87.50 / 95.30) / 10),
+		quantize_i16(14.0 / 23),
+		quantize_i16(6.0 / 6),                      /* Sun = 6 */
+		quantize_i16(158.0 / 1440),                 /* minutes between */
+		quantize_i16(0.8 / 1000),
+		quantize_i16(3.2 / 1000),
+		quantize_i16(5.0 / 20),
+		quantize_i16(0.0),
+		quantize_i16(1.0),
+		quantize_i16(0.0),                          /* MERC-005 is known */
+		quantize_i16(mcc_risk(5411)),
+		quantize_i16(102.45 / 10000),
 		0, 0,
 	};
 
