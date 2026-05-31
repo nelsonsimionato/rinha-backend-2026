@@ -3,30 +3,33 @@
 
 #include "compat.h"
 
-/* Global pointers into the mmap'd index file. Read-only after init.
- * Layout per format v11 (matches tools/build_partition_hash.go):
- *   [0:16]     header
- *   [16: ...]                   partitionOffsets[PARTITION_COUNT] uint32
- *   [+]                         partitionSizes[PARTITION_COUNT]   uint32
- *   [+]                         partitionMin   [PARTITION_COUNT][16] uint8
- *   [+]                         partitionMax   [PARTITION_COUNT][16] uint8
- *   [+]                         data[N][16] uint8 (sorted by partition)
- *   [+]                         isFraud[N]  uint8
+/* KD-tree node, 40 bytes. Mirrors tools/build_kdtree.go on-disk layout.
+ *   bmin/bmax : subtree axis-aligned bounding box (dims 14,15 = 0).
+ *   a, b      : internal -> (left child idx, right child idx, b high bit clear)
+ *               leaf     -> (first record idx, count | KD_LEAF_FLAG)
  */
-extern const uint32_t *partition_offsets;
-extern const uint32_t *partition_sizes;
-extern const uint8_t  *partition_min;    /* PARTITION_COUNT * 16 bytes */
-extern const uint8_t  *partition_max;
-extern const uint8_t  *data;             /* total * 16 bytes */
-extern const uint8_t  *is_fraud;         /* total bytes */
-extern uint32_t        total_records;
+typedef struct {
+	uint8_t  bmin[RECORD_STRIDE];
+	uint8_t  bmax[RECORD_STRIDE];
+	uint32_t a;
+	uint32_t b;
+} KDNode;
 
-/* Pre-computed non-empty partition indices for fast iteration in SearchKNN. */
-extern uint16_t        non_empty_partitions[PARTITION_COUNT];
-extern uint32_t        non_empty_count;
+/* Global pointers into the mmap'd index file. Read-only after init.
+ * Layout per format v12 (matches tools/build_kdtree.go):
+ *   [0:16]   header (version, N at [4:8], nodeCount at [8:12])
+ *   [16:..]  nodes[node_count] × KDNode (40 bytes)
+ *   [..]     data[N][16] uint8 (reordered into KD leaf order)
+ *   [..]     isFraud[N]  uint8 (same order)
+ */
+extern const KDNode  *kd_nodes;
+extern uint32_t       kd_node_count;
+extern const uint8_t *data;            /* total * 16 bytes, leaf-ordered */
+extern const uint8_t *is_fraud;        /* total bytes, same order */
+extern uint32_t       total_records;
 
-/* mmap the index file, validate format version, set up all pointers and the
- * non_empty_partitions[] list. Returns 0 on success, -1 on failure. */
+/* mmap the index file, validate format version, set up all pointers.
+ * Returns 0 on success, -1 on failure. */
 int index_load(const char *path);
 
 #endif /* INDEX_H */

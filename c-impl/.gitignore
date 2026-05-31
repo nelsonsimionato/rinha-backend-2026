@@ -6,3 +6,5 @@ tests/test_distance
 tests/test_json
 tests/test_search
 tests/test_vectorize
+tests/test_kd_exact
+tests/bench_kd

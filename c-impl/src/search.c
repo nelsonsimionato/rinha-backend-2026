@@ -1,7 +1,8 @@
 #include "search.h"
 #include "distance.h"
 #include "index.h"
-#include "partition.h"
+
+STATIC_ASSERT(sizeof(KDNode) == KD_NODE_BYTES, "KDNode must be 40 bytes (on-disk layout)");
 
 /* Insertion sort: maintain ascending dist_sq among first K items. */
 ALWAYS_INLINE void knn_push(SearchState *st, uint32_t d, int32_t idx)
@@ -22,38 +23,14 @@ ALWAYS_INLINE void knn_push(SearchState *st, uint32_t d, int32_t idx)
 	}
 }
 
-/* Bounded insertion into candidates[] sorted ascending by bound; discards
- * candidates with bound >= worst-of-current. Cap at MAX_CANDIDATES. */
-ALWAYS_INLINE void cand_push(SearchState *st, uint32_t b, uint16_t idx)
+/* Records ahead to prefetch. 8 * 16B = 128 B = 2 cache lines. */
+#define PREFETCH_AHEAD 8
+
+/* Scan a leaf's [start, start+count) records into the top-K queue. */
+ALWAYS_INLINE void scan_leaf(const uint8_t *query, uint32_t start, uint32_t count,
+                             SearchState *st)
 {
-	if (st->n_cands < MAX_CANDIDATES) {
-		st->cands[st->n_cands].bound = b;
-		st->cands[st->n_cands].idx   = idx;
-		st->n_cands++;
-		for (int i = st->n_cands - 1; i > 0 && st->cands[i].bound < st->cands[i-1].bound; i--) {
-			Candidate tmp = st->cands[i]; st->cands[i] = st->cands[i-1]; st->cands[i-1] = tmp;
-		}
-		return;
-	}
-	if (b >= st->cands[MAX_CANDIDATES - 1].bound) return;
-	st->cands[MAX_CANDIDATES - 1].bound = b;
-	st->cands[MAX_CANDIDATES - 1].idx   = idx;
-	for (int i = MAX_CANDIDATES - 1; i > 0 && st->cands[i].bound < st->cands[i-1].bound; i--) {
-		Candidate tmp = st->cands[i]; st->cands[i] = st->cands[i-1]; st->cands[i-1] = tmp;
-	}
-}
-
-/* Records ahead to prefetch. 16 * 16B = 256 B = 4 cache lines. Matches the
- * latency-to-DRAM (~200 cycles) vs ~5 records/cycle throughput. */
-#define PREFETCH_AHEAD 16
-
-ALWAYS_INLINE void scan_partition(const uint8_t *query, uint16_t pidx, SearchState *st)
-{
-	uint32_t start = partition_offsets[pidx];
-	uint32_t size  = partition_sizes[pidx];
-	if (size == 0) return;
-	uint32_t end = start + size;
-
+	uint32_t end = start + count;
 	uint32_t r = start;
 	for (; r + 4 <= end; r += 4) {
 		__builtin_prefetch(&data[(size_t)(r + PREFETCH_AHEAD) * RECORD_STRIDE], 0, 1);
@@ -70,33 +47,48 @@ ALWAYS_INLINE void scan_partition(const uint8_t *query, uint16_t pidx, SearchSta
 	}
 }
 
+/* Exact KD k-NN. Iterative best-effort DFS: at each internal node, descend the
+ * child whose bounding box is nearer first (tightens the K-th distance early),
+ * and prune a node when its box lower-bound is already >= the current K-th.
+ * The stack holds at most the tree height (<< KD_STACK_SIZE). */
 void search_knn(const uint8_t query[RECORD_STRIDE], SearchState *st,
                 Neighbor out[K])
 {
-	st->q_count  = 0;
-	st->n_cands  = 0;
+	st->q_count = 0;
+	if (UNLIKELY(kd_node_count == 0)) {
+		for (int i = 0; i < K; i++) { out[i].dist_sq = ~0u; out[i].node_idx = 0; }
+		return;
+	}
 
-	uint16_t match_key = partition_key(query);
-	uint32_t match_size = partition_sizes[match_key];
-	scan_partition(query, match_key, st);
+	int sp = 0;
+	st->stack[sp++] = 0; /* root */
 
-	if (match_size < SKIP_BOUND_PRUNE_IF_MATCHING_AT_LEAST) {
-		/* Sparse matching: fall through to exhaustive bound-pruned search. */
-		uint32_t worst = ~(uint32_t)0;
-		if (st->q_count >= K) worst = st->q[K-1].dist_sq;
+	while (sp > 0) {
+		uint32_t ni = st->stack[--sp];
+		const KDNode *nd = &kd_nodes[ni];
 
-		for (uint32_t i = 0; i < non_empty_count; i++) {
-			uint16_t pidx = non_empty_partitions[i];
-			if (pidx == match_key) continue;
-			uint32_t b = bound_dist_sq(query,
-			                            &partition_min[(size_t)pidx * RECORD_STRIDE],
-			                            &partition_max[(size_t)pidx * RECORD_STRIDE]);
-			if (b < worst) cand_push(st, b, pidx);
+		/* Prune: if the box can't beat the current K-th neighbor, skip. */
+		if (st->q_count >= K) {
+			uint32_t b = bound_dist_sq(query, nd->bmin, nd->bmax);
+			if (b >= st->q[K-1].dist_sq) continue;
 		}
 
-		for (int i = 0; i < st->n_cands; i++) {
-			if (st->q_count >= K && st->cands[i].bound >= st->q[K-1].dist_sq) break;
-			scan_partition(query, st->cands[i].idx, st);
+		if (nd->b & KD_LEAF_FLAG) {
+			scan_leaf(query, nd->a, nd->b & KD_COUNT_MASK, st);
+			continue;
+		}
+
+		/* Internal: order children by box lower-bound, push far then near so
+		 * the near child is popped (and scanned) first. */
+		uint32_t L = nd->a, R = nd->b;
+		uint32_t bl = bound_dist_sq(query, kd_nodes[L].bmin, kd_nodes[L].bmax);
+		uint32_t br = bound_dist_sq(query, kd_nodes[R].bmin, kd_nodes[R].bmax);
+		if (bl <= br) {
+			st->stack[sp++] = R;
+			st->stack[sp++] = L;
+		} else {
+			st->stack[sp++] = L;
+			st->stack[sp++] = R;
 		}
 	}
 

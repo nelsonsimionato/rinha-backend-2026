@@ -7,20 +7,21 @@
 
 #include "index.h"
 
-const uint32_t *partition_offsets;
-const uint32_t *partition_sizes;
-const uint8_t  *partition_min;
-const uint8_t  *partition_max;
-const uint8_t  *data;
-const uint8_t  *is_fraud;
-uint32_t        total_records;
-
-uint16_t        non_empty_partitions[PARTITION_COUNT];
-uint32_t        non_empty_count;
+const KDNode  *kd_nodes;
+uint32_t       kd_node_count;
+const uint8_t *data;
+const uint8_t *is_fraud;
+uint32_t       total_records;
 
 /* dummy byte to force page reads (kept volatile so the compiler doesn't
  * eliminate the prewarm loop). */
 static volatile uint8_t prewarm_sink;
+
+static uint32_t rd_u32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
+	       (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
 
 int index_load(const char *path)
 {
@@ -54,26 +55,17 @@ int index_load(const char *path)
 		        (unsigned)ver, (unsigned)FORMAT_VERSION);
 		return -1;
 	}
-	/* totalRecords stored at offset 4 (little-endian uint32) */
-	uint32_t total =
-	      ((uint32_t)buf[4])        |
-	      ((uint32_t)buf[5]) <<  8  |
-	      ((uint32_t)buf[6]) << 16  |
-	      ((uint32_t)buf[7]) << 24;
+	uint32_t total  = rd_u32(buf + 4);   /* N         */
+	uint32_t nnodes = rd_u32(buf + 8);   /* nodeCount */
 	total_records = total;
+	kd_node_count = nnodes;
 
 	size_t off = HEADER_SIZE;
-	partition_offsets = (const uint32_t *)(buf + off);
-	off += PARTITION_COUNT * 4;
-	partition_sizes   = (const uint32_t *)(buf + off);
-	off += PARTITION_COUNT * 4;
-	partition_min     = buf + off;
-	off += PARTITION_COUNT * RECORD_STRIDE;
-	partition_max     = buf + off;
-	off += PARTITION_COUNT * RECORD_STRIDE;
+	kd_nodes = (const KDNode *)(buf + off);
+	off += (size_t)nnodes * KD_NODE_BYTES;
 
-	size_t data_len    = (size_t)total * RECORD_STRIDE;
-	size_t expected    = off + data_len + total;
+	size_t data_len = (size_t)total * RECORD_STRIDE;
+	size_t expected = off + data_len + total;
 	if (size < expected) {
 		fprintf(stderr, "index_load: truncated (%zu bytes, expected %zu)\n", size, expected);
 		return -1;
@@ -82,22 +74,13 @@ int index_load(const char *path)
 	off     += data_len;
 	is_fraud = buf + off;
 
-	/* Build non_empty_partitions[] for fast iteration */
-	non_empty_count = 0;
-	for (uint32_t i = 0; i < PARTITION_COUNT; i++) {
-		if (partition_sizes[i] > 0) {
-			non_empty_partitions[non_empty_count++] = (uint16_t)i;
-		}
-	}
-
 	/* Pre-warm physical pages: 1 byte per 4 KB page faults each one in. */
 	for (size_t i = 0; i < size; i += 4096) {
 		prewarm_sink += buf[i];
 	}
 
 	fprintf(stderr,
-	        "index_load: v%u, records=%u, non_empty=%u/%u, %.1f MB\n",
-	        (unsigned)ver, total, non_empty_count, PARTITION_COUNT,
-	        (double)size / 1e6);
+	        "index_load: v%u, records=%u, kd_nodes=%u, %.1f MB\n",
+	        (unsigned)ver, total, nnodes, (double)size / 1e6);
 	return 0;
 }

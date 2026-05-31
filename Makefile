@@ -10,12 +10,13 @@ clean-host:
 generate:
 	go run tools/mccgen.go
 
-# Build the feature-hash partition index (format v6) from resources/references.json.gz.
-# Splits records into 256 pools by an 8-bit hash of fraud-discriminative dimensions
-# (idx 5,9,10,11,12,2). Runtime brute-force scans matching partition + 8 Hamming-1
-# neighbors per query. Deterministic, no clustering, no tuning knobs.
-resources/index.bin: resources/references.json.gz tools/build_partition_hash.go
-	go run tools/build_partition_hash.go
+# Build the balanced KD-tree index (format v12) from resources/references.json.gz.
+# Sliding-midpoint splits on the widest-spread dim, leaf size 32; each node stores
+# its subtree AABB so the C runtime prunes exactly with the AVX2 bound_dist_sq kernel.
+# Exact 5-NN recall, ~244 records scanned/query (was ~76K with the feature-hash
+# partition in build_partition_hash.go, kept for reference).
+resources/index.bin: resources/references.json.gz tools/build_kdtree.go
+	go run tools/build_kdtree.go
 
 # Alias for the index-bin file target
 index: resources/index.bin
