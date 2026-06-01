@@ -1,14 +1,14 @@
+# v0.21: v0.18 FD-passing topology + startup warmup + EPOLL_TIMEOUT_MS=1.
+# NO cpuset (v0.20 cpuset regressed p99 on the test box — see issue #1).
+# API image v0.20-fd-warm adds two env-gated knobs over v0.18-fd:
+#   - WARMUP_QUERIES=5000 : run 5000 searches over sample index vectors at boot
+#                           to warm the search path (branch predictors, I-cache).
+#   - EPOLL_TIMEOUT_MS=1  : epoll_wait polls every 1ms instead of blocking, to
+#                           keep the API runnable and cut wakeup latency.
+# LB image unchanged (v0.18-lbfd). Budget: 0.10 + 2×0.45 = 1.0 CPU, 350 MB.
 networks:
   rinha_net:
     driver: bridge
-
-# v0.18: single-hop FD-passing. The LB (lbfd) accepts client connections and
-# hands the socket FD to an API via SCM_RIGHTS over a shared-volume unix socket;
-# the API serves the client DIRECTLY (the LB leaves the data path). Eliminates
-# the 2-hop proxy wakeups behind the p99. All on the bridge network (spec-clean);
-# the shared `sock` volume only carries the unix-domain socket. CPU is flipped
-# back to the APIs since the LB is now near-idle.
-# Budget: 0.10 (lb) + 2×0.45 (api) = 1.0 CPU, 30 + 2×160 = 350 MB.
 volumes:
   sock: {}
 
@@ -34,9 +34,11 @@ services:
         condition: service_healthy
 
   api1: &api
-    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.18-fd
+    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.20-fd-warm
     environment:
       - FDSOCK=/sock/api1.sock
+      - EPOLL_TIMEOUT_MS=1
+      - WARMUP_QUERIES=5000
     volumes:
       - sock:/sock
     deploy:
@@ -57,3 +59,5 @@ services:
     <<: *api
     environment:
       - FDSOCK=/sock/api2.sock
+      - EPOLL_TIMEOUT_MS=1
+      - WARMUP_QUERIES=5000
