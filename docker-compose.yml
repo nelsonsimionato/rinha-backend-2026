@@ -2,12 +2,19 @@ networks:
   rinha_net:
     driver: bridge
 
-# v0.18: single-hop FD-passing. The LB (lbfd) accepts client connections and
-# hands the socket FD to an API via SCM_RIGHTS over a shared-volume unix socket;
-# the API serves the client DIRECTLY (the LB leaves the data path). Eliminates
-# the 2-hop proxy wakeups behind the p99. All on the bridge network (spec-clean);
-# the shared `sock` volume only carries the unix-domain socket. CPU is flipped
-# back to the APIs since the LB is now near-idle.
+# v0.20: v0.18 FD-passing topology + cpuset CPU-core pinning (chase sub-1ms p99).
+# Single-hop FD-passing: the LB (lbfd) accepts client connections and hands the
+# socket FD to an API via SCM_RIGHTS over a shared-volume unix socket; the API
+# serves the client DIRECTLY (LB leaves the data path). All on the bridge network.
+#
+# NEW in v0.20: pin each container to dedicated cores via `cpuset` (api1->0,
+# api2->1, lb->2,3). On the 4-vCPU GHA runner, unpinned API processes get
+# migrated across cores on each wakeup (cold cache + run-queue contention +
+# inescapable vCPU steal) — the ~0.8ms tail behind our 1.2ms p99. Pinning gives
+# each API a warm, uncontended core. Evidence: every sub-0.4ms / 6000 entry on
+# the preview leaderboard pins with cpuset; every ~1.2ms entry (incl. us) did
+# not. `cpuset` is placement, NOT quota — it does not count against the 1-CPU
+# limit (cpus quotas below still sum to 1.0).
 # Budget: 0.10 (lb) + 2×0.45 (api) = 1.0 CPU, 30 + 2×160 = 350 MB.
 volumes:
   sock: {}
@@ -20,6 +27,7 @@ services:
       - "9999:9999"
     volumes:
       - sock:/sock
+    cpuset: "2,3"
     deploy:
       resources:
         limits:
@@ -39,6 +47,7 @@ services:
       - FDSOCK=/sock/api1.sock
     volumes:
       - sock:/sock
+    cpuset: "0"
     deploy:
       resources:
         limits:
@@ -55,5 +64,6 @@ services:
 
   api2:
     <<: *api
+    cpuset: "1"
     environment:
       - FDSOCK=/sock/api2.sock
