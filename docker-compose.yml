@@ -1,11 +1,9 @@
-# v0.21: v0.18 FD-passing topology + startup warmup + EPOLL_TIMEOUT_MS=1.
-# NO cpuset (v0.20 cpuset regressed p99 on the test box — see issue #1).
-# API image v0.20-fd-warm adds two env-gated knobs over v0.18-fd:
-#   - WARMUP_QUERIES=5000 : run 5000 searches over sample index vectors at boot
-#                           to warm the search path (branch predictors, I-cache).
-#   - EPOLL_TIMEOUT_MS=1  : epoll_wait polls every 1ms instead of blocking, to
-#                           keep the API runnable and cut wakeup latency.
-# LB image unchanged (v0.18-lbfd). Budget: 0.10 + 2×0.45 = 1.0 CPU, 350 MB.
+# v0.22: v0.21 (warmup + EPOLL_TIMEOUT_MS=1, no cpuset) + SPIN_US=50.
+# Spin-before-block on the epoll loop: busy-poll up to 50µs to catch imminent
+# requests with no scheduler-wakeup latency (the lever dalvorsn/fksegundo use
+# to hit 0.37ms). Bounded spin (~6% idle CPU at 50µs) — safe under 0.45 quota.
+# Goal: shave ~0.11ms off v0.21's 1.111ms p99 to cross the 1.0ms / 6000 cap.
+# Image v0.22-fd-spin; LB unchanged. cpus 0.45/0.45/0.10 = 1.0, mem 350MB.
 networks:
   rinha_net:
     driver: bridge
@@ -34,11 +32,12 @@ services:
         condition: service_healthy
 
   api1: &api
-    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.20-fd-warm
+    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.22-fd-spin
     environment:
       - FDSOCK=/sock/api1.sock
       - EPOLL_TIMEOUT_MS=1
       - WARMUP_QUERIES=5000
+      - SPIN_US=50
     volumes:
       - sock:/sock
     deploy:
@@ -61,3 +60,4 @@ services:
       - FDSOCK=/sock/api2.sock
       - EPOLL_TIMEOUT_MS=1
       - WARMUP_QUERIES=5000
+      - SPIN_US=50
