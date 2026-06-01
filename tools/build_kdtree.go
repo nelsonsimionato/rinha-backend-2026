@@ -39,12 +39,12 @@ import (
 const (
 	Dimensions    = 14
 	RecordStride  = 16 // i16 lanes per record (14 dims + 2 zero pad)
-	FormatVersion = uint8(13)
+	FormatVersion = uint8(14)
 	HeaderSize    = 16
 	LeafSize      = 32
 	NodeBytes     = 72
-	I16Scale      = 5000
-	I16Sentinel   = int16(-5000)
+	I16Scale      = 10000
+	I16Sentinel   = int16(-10000)
 	LeafFlag      = uint32(0x80000000)
 	CountMask     = uint32(0x7fffffff)
 )
