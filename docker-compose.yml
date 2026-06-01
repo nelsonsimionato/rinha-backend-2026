@@ -1,17 +1,26 @@
+# v0.23: v0.22 (warmup + EPOLL_TIMEOUT_MS=1 + SPIN_US=50) + cpuset RELAYOUT 1/2/3.
+# api1->cpu1, api2->cpu2, lb->cpu3 — leaving cpu0 free for the OS/IRQs and the
+# k6 load generator. This is the layout SrPatoS's C backend uses to hit 0.87ms.
+# Our earlier cpuset attempt (v0.20) regressed because it used 0/1/2,3, which
+# parked api1 on the IRQ-busy cpu0 and put the LB on the APIs' HT siblings.
+# Single-submission probe; revert to v0.22 if it regresses.
+# Image v0.22-fd-spin (unchanged). cpus 0.45/0.45/0.10 = 1.0, mem 350MB; cpuset
+# is placement, not quota — does not count against the 1-CPU limit.
 networks:
   rinha_net:
     driver: bridge
+volumes:
+  sock: {}
 
-# Phase 2 topology: 2 API instances (i16 index is ~118 MB, no longer fits the
-# 4×80 MB layout). Budget: 2×0.45 + 0.10 = 1.0 CPU, 2×160 + 30 = 350 MB.
-# Each API holds the full index (no sharding); the LB round-robins.
 services:
-  haproxy:
-    image: haproxy:2.8-alpine
-    volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+  lb:
+    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.18-lbfd
+    command: ["--port", "9999", "/sock/api1.sock", "/sock/api2.sock"]
     ports:
       - "9999:9999"
+    volumes:
+      - sock:/sock
+    cpuset: "3"
     deploy:
       resources:
         limits:
@@ -26,9 +35,15 @@ services:
         condition: service_healthy
 
   api1: &api
-    build:
-      context: .
-      dockerfile: c-impl/Dockerfile   # C impl; root Dockerfile is the legacy Go build
+    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.22-fd-spin
+    environment:
+      - FDSOCK=/sock/api1.sock
+      - EPOLL_TIMEOUT_MS=1
+      - WARMUP_QUERIES=5000
+      - SPIN_US=50
+    volumes:
+      - sock:/sock
+    cpuset: "1"
     deploy:
       resources:
         limits:
@@ -37,9 +52,7 @@ services:
     networks:
       - rinha_net
     healthcheck:
-      # C image: self-probe via the built-in healthcheck mode.
       test: ["CMD", "/api", "--healthcheck"]
-      # Cold start spans the 118 MB i16 index mmap + pre-warm loop (one byte / 4KB page).
       start_period: 12s
       interval: 5s
       timeout: 3s
@@ -47,3 +60,9 @@ services:
 
   api2:
     <<: *api
+    cpuset: "2"
+    environment:
+      - FDSOCK=/sock/api2.sock
+      - EPOLL_TIMEOUT_MS=1
+      - WARMUP_QUERIES=5000
+      - SPIN_US=50
