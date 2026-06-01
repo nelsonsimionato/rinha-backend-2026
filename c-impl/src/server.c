@@ -51,6 +51,16 @@ static int   lb_conn[8];            /* connected LB handoff channels (FD sources
 static int   n_lb_conn = 0;
 static volatile sig_atomic_t stop_flag = 0;
 
+/* O(1) fd -> conn-slot map (replaces the per-event linear scan). Container fds
+ * stay small (< a few hundred); sized generously. -1 = not a client conn. */
+#define FD_SLOT_SIZE 65536
+static int   fd_slot[FD_SLOT_SIZE];
+
+/* Brief socket busy-poll: spin a few µs in epoll/recv before sleeping, cutting
+ * wakeup-latency at the p99 tail. ~µs of spin at this request rate (~1% CPU),
+ * so the 0.45-CPU quota is not at risk. setsockopt failures are ignored. */
+#define BUSY_POLL_US 30
+
 static void on_signal(int sig) { (void)sig; stop_flag = 1; }
 
 static int find_free_slot(void)
@@ -64,9 +74,28 @@ static void conn_close(Conn *c)
 {
 	if (c->fd >= 0) {
 		epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
+		if (c->fd < FD_SLOT_SIZE) fd_slot[c->fd] = -1;
 		close(c->fd);
 		c->fd = -1;
 	}
+}
+
+/* Latency socket tuning applied to each client socket. All optional —
+ * failures (EPERM/ENOPROTOOPT in restricted containers) are harmless. */
+static void tune_client_socket(int cfd)
+{
+	int one = 1;
+	setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#ifdef TCP_QUICKACK
+	setsockopt(cfd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+#endif
+#ifdef SO_BUSY_POLL
+	int bp = BUSY_POLL_US;
+	setsockopt(cfd, SOL_SOCKET, SO_BUSY_POLL, &bp, sizeof(bp));
+#endif
+#ifdef SO_PREFER_BUSY_POLL
+	setsockopt(cfd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &one, sizeof(one));
+#endif
 }
 
 static void conn_reset_for_next(Conn *c)
@@ -85,14 +114,17 @@ static void accept_client_fd(int cfd)
 	if (slot < 0) { close(cfd); return; }
 	int fl = fcntl(cfd, F_GETFL, 0);
 	if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);  /* ET epoll needs nonblock */
-	int one = 1;
-	setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+	tune_client_socket(cfd);
 	conns[slot].fd = cfd;
+	if (cfd < FD_SLOT_SIZE) fd_slot[cfd] = slot;       /* O(1) lookup */
 	conn_reset_for_next(&conns[slot]);
 	struct epoll_event cev = {0};
 	cev.events  = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
 	cev.data.fd = cfd;
-	if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0) { close(cfd); conns[slot].fd = -1; }
+	if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0) {
+		close(cfd); conns[slot].fd = -1;
+		if (cfd < FD_SLOT_SIZE) fd_slot[cfd] = -1;
+	}
 }
 
 /* Queue a response (pointer + length) for write. The buffer is static,
@@ -289,6 +321,7 @@ int server_run(int port)
 	signal(SIGPIPE, SIG_IGN);
 
 	for (int i = 0; i < MAX_CONNECTIONS; i++) conns[i].fd = -1;
+	for (int i = 0; i < FD_SLOT_SIZE; i++) fd_slot[i] = -1;
 
 	listen_fd = setup_listener(port);
 	if (listen_fd < 0) { perror("listen"); return -1; }
@@ -367,10 +400,12 @@ int server_run(int port)
 				continue;
 			}
 
-			/* Find the connection slot for this fd. */
+			/* O(1) fd -> conn slot (verified against the slot's fd). */
 			Conn *c = NULL;
-			for (int s = 0; s < MAX_CONNECTIONS; s++)
-				if (conns[s].fd == fd) { c = &conns[s]; break; }
+			if (fd >= 0 && fd < FD_SLOT_SIZE) {
+				int s = fd_slot[fd];
+				if (s >= 0 && s < MAX_CONNECTIONS && conns[s].fd == fd) c = &conns[s];
+			}
 			if (!c) {
 				/* Stale event: defensively unregister. */
 				epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
