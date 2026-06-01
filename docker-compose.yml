@@ -2,17 +2,28 @@ networks:
   rinha_net:
     driver: bridge
 
+# v0.18: single-hop FD-passing. The LB (lbfd) accepts client connections and
+# hands the socket FD to an API via SCM_RIGHTS over a shared-volume unix socket;
+# the API serves the client DIRECTLY (the LB leaves the data path). Eliminates
+# the 2-hop proxy wakeups behind the p99. All on the bridge network (spec-clean);
+# the shared `sock` volume only carries the unix-domain socket. CPU is flipped
+# back to the APIs since the LB is now near-idle.
+# Budget: 0.10 (lb) + 2×0.45 (api) = 1.0 CPU, 30 + 2×160 = 350 MB.
+volumes:
+  sock: {}
+
 services:
-  haproxy:
-    image: haproxy:2.8-alpine
-    volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+  lb:
+    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.18-lbfd
+    command: ["--port", "9999", "/sock/api1.sock", "/sock/api2.sock"]
     ports:
       - "9999:9999"
+    volumes:
+      - sock:/sock
     deploy:
       resources:
         limits:
-          cpus: '0.50'
+          cpus: '0.10'
           memory: 30M
     networks:
       - rinha_net
@@ -22,16 +33,16 @@ services:
       api2:
         condition: service_healthy
 
-  # v0.16: CPU rebalanced to the LB. Diagnosis showed the p99 was HAProxy
-  # throttling at 0.10 CPU while the APIs sat idle (~0.01 CPU used of 0.45).
-  # Budget: 0.50 (haproxy) + 2×0.25 (api) = 1.0 CPU, 30 + 2×160 = 350 MB.
-  # Each API holds the full i16 index (no sharding); haproxy round-robins.
   api1: &api
-    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.17-s10k
+    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.18-fd
+    environment:
+      - FDSOCK=/sock/api1.sock
+    volumes:
+      - sock:/sock
     deploy:
       resources:
         limits:
-          cpus: '0.25'
+          cpus: '0.45'
           memory: 160M
     networks:
       - rinha_net
@@ -44,3 +55,5 @@ services:
 
   api2:
     <<: *api
+    environment:
+      - FDSOCK=/sock/api2.sock
