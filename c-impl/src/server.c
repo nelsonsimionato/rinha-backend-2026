@@ -282,11 +282,37 @@ static int drain_lb_fds(int uxfd)
 	}
 }
 
+/* Warm the search path before real traffic: run n_queries searches over
+ * evenly-strided sample vectors from the loaded index. Warms branch predictors,
+ * the I-cache and the KD/AVX2 kernels (the index pages are already faulted in by
+ * index_load's MAP_POPULATE). No-op if n_queries <= 0 or no index. */
+void server_warmup(int n_queries)
+{
+	if (n_queries <= 0 || total_records == 0 || data == NULL) return;
+	SearchState st;
+	Neighbor    neigh[K];
+	uint32_t step = total_records / (uint32_t)n_queries;
+	if (step == 0) step = 1;
+	volatile int32_t sink = 0;
+	for (int i = 0; i < n_queries; i++) {
+		uint32_t idx = ((uint32_t)i * step) % total_records;
+		search_knn(data + (size_t)idx * RECORD_STRIDE, &st, neigh);
+		sink += neigh[0].node_idx;   /* keep the call live */
+	}
+	(void)sink;
+	fprintf(stderr, "server: warmup %d queries done\n", n_queries);
+}
+
 int server_run(int port)
 {
 	signal(SIGTERM, on_signal);
 	signal(SIGINT,  on_signal);
 	signal(SIGPIPE, SIG_IGN);
+
+	/* epoll_wait timeout (ms). Default -1 = block. EPOLL_TIMEOUT_MS=1 polls
+	 * every 1ms to keep a pinned core/vCPU out of deep idle. */
+	const char *et = getenv("EPOLL_TIMEOUT_MS");
+	int epoll_timeout = (et && et[0]) ? atoi(et) : -1;
 
 	for (int i = 0; i < MAX_CONNECTIONS; i++) conns[i].fd = -1;
 
@@ -318,7 +344,7 @@ int server_run(int port)
 	struct epoll_event events[64];
 
 	while (!stop_flag) {
-		int n = epoll_wait(epfd, events, 64, -1);
+		int n = epoll_wait(epfd, events, 64, epoll_timeout);
 		if (n < 0) {
 			if (errno == EINTR) continue;
 			perror("epoll_wait");

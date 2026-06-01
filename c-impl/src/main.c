@@ -63,5 +63,11 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	/* Optional warmup before serving: WARMUP_QUERIES searches over sample
+	 * vectors to warm the search path (branch predictors, caches). */
+	const char *env_warm = getenv("WARMUP_QUERIES");
+	int n_warm = (env_warm && env_warm[0]) ? atoi(env_warm) : 0;
+	if (n_warm > 0) server_warmup(n_warm);
+
 	return server_run(port);
 }
