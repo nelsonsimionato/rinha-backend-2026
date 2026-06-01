@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "http.h"
@@ -45,6 +46,9 @@ typedef struct {
 static Conn  conns[MAX_CONNECTIONS];
 static int   epfd = -1;
 static int   listen_fd = -1;
+static int   unix_listen_fd = -1;   /* AF_UNIX listener for LB FD handoff (optional) */
+static int   lb_conn[8];            /* connected LB handoff channels (FD sources) */
+static int   n_lb_conn = 0;
 static volatile sig_atomic_t stop_flag = 0;
 
 static void on_signal(int sig) { (void)sig; stop_flag = 1; }
@@ -71,6 +75,24 @@ static void conn_reset_for_next(Conn *c)
 	c->read_len        = 0;
 	c->write_ptr       = NULL;
 	c->write_remaining = 0;
+}
+
+/* Insert an accepted (TCP) or received (FD-handoff) client fd into the conn
+ * pool + epoll. Shared by the TCP accept loop and the LB FD receiver. */
+static void accept_client_fd(int cfd)
+{
+	int slot = find_free_slot();
+	if (slot < 0) { close(cfd); return; }
+	int fl = fcntl(cfd, F_GETFL, 0);
+	if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);  /* ET epoll needs nonblock */
+	int one = 1;
+	setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+	conns[slot].fd = cfd;
+	conn_reset_for_next(&conns[slot]);
+	struct epoll_event cev = {0};
+	cev.events  = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
+	cev.data.fd = cfd;
+	if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0) { close(cfd); conns[slot].fd = -1; }
 }
 
 /* Queue a response (pointer + length) for write. The buffer is static,
@@ -207,6 +229,59 @@ static int setup_listener(int port)
 	return fd;
 }
 
+/* AF_UNIX stream listener for the FD-passing LB. The API owns the socket
+ * (created on a shared volume); the LB connects and hands off client FDs. */
+static int setup_unix_listener(const char *path)
+{
+	unlink(path);
+	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if (fd < 0) return -1;
+	struct sockaddr_un sa = {0};
+	sa.sun_family = AF_UNIX;
+	snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", path);
+	if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) { close(fd); return -1; }
+	if (listen(fd, 16) < 0) { close(fd); return -1; }
+	return fd;
+}
+
+static int is_lb_conn(int fd)
+{
+	for (int i = 0; i < n_lb_conn; i++) if (lb_conn[i] == fd) return 1;
+	return 0;
+}
+
+static void remove_lb_conn(int fd)
+{
+	for (int i = 0; i < n_lb_conn; i++)
+		if (lb_conn[i] == fd) { lb_conn[i] = lb_conn[--n_lb_conn]; return; }
+}
+
+/* Receive all pending client FDs handed off by the LB over `uxfd` (SCM_RIGHTS).
+ * Returns 0 (drained) or -1 (LB closed/error -> caller drops the channel). */
+static int drain_lb_fds(int uxfd)
+{
+	for (;;) {
+		char dummy;
+		struct iovec io = { .iov_base = &dummy, .iov_len = 1 };
+		union { char buf[CMSG_SPACE(sizeof(int))]; struct cmsghdr align; } u;
+		struct msghdr msg = {0};
+		msg.msg_iov = &io; msg.msg_iovlen = 1;
+		msg.msg_control = u.buf; msg.msg_controllen = sizeof(u.buf);
+		ssize_t n = recvmsg(uxfd, &msg, 0);
+		if (n > 0) {
+			struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+			if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+				int cfd; memcpy(&cfd, CMSG_DATA(cmsg), sizeof(int));
+				accept_client_fd(cfd);
+			}
+			continue;
+		}
+		if (n == 0) return -1;                               /* LB closed */
+		if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;/* drained */
+		return -1;
+	}
+}
+
 int server_run(int port)
 {
 	signal(SIGTERM, on_signal);
@@ -227,6 +302,19 @@ int server_run(int port)
 	ev.data.fd = listen_fd;  /* listener uses fd as marker */
 	if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev) < 0) { perror("epoll_ctl listen"); return -1; }
 
+	/* Optional FD-handoff channel: if FDSOCK is set, also accept client FDs
+	 * passed by the LB over a unix socket (single-hop, LB out of the data path).
+	 * The TCP listener above stays up for the /ready healthcheck. */
+	const char *fdsock = getenv("FDSOCK");
+	if (fdsock && fdsock[0]) {
+		unix_listen_fd = setup_unix_listener(fdsock);
+		if (unix_listen_fd < 0) { perror("unix listen"); return -1; }
+		struct epoll_event uev = {0};
+		uev.events = EPOLLIN; uev.data.fd = unix_listen_fd;
+		epoll_ctl(epfd, EPOLL_CTL_ADD, unix_listen_fd, &uev);
+		fprintf(stderr, "server: FD-handoff listening on %s\n", fdsock);
+	}
+
 	struct epoll_event events[64];
 
 	while (!stop_flag) {
@@ -240,23 +328,41 @@ int server_run(int port)
 			int fd = events[i].data.fd;
 
 			if (fd == listen_fd) {
-				/* Accept loop (edge-triggered, drain). */
+				/* TCP accept loop (edge-triggered, drain). */
 				for (;;) {
 					int cfd = accept4(listen_fd, NULL, NULL,
 					                  SOCK_NONBLOCK | SOCK_CLOEXEC);
 					if (cfd < 0) break;
-					int slot = find_free_slot();
-					if (slot < 0) { close(cfd); continue; }
-					int one = 1;
-					setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-					conns[slot].fd = cfd;
-					conn_reset_for_next(&conns[slot]);
-					struct epoll_event cev = {0};
-					cev.events  = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
-					cev.data.fd = cfd;
-					if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0) {
-						close(cfd); conns[slot].fd = -1;
-					}
+					accept_client_fd(cfd);
+				}
+				continue;
+			}
+
+			if (fd == unix_listen_fd) {
+				/* LB connected its FD-handoff channel — accept it. */
+				for (;;) {
+					int lfd = accept4(unix_listen_fd, NULL, NULL,
+					                  SOCK_NONBLOCK | SOCK_CLOEXEC);
+					if (lfd < 0) break;
+					if (n_lb_conn < (int)(sizeof(lb_conn)/sizeof(lb_conn[0]))) {
+						lb_conn[n_lb_conn++] = lfd;
+						struct epoll_event lev = {0};
+						lev.events = EPOLLIN | EPOLLET;
+						lev.data.fd = lfd;
+						if (epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &lev) < 0) {
+							close(lfd); n_lb_conn--;
+						}
+					} else { close(lfd); }
+				}
+				continue;
+			}
+
+			if (is_lb_conn(fd)) {
+				/* Drain handed-off client FDs into the conn pool. */
+				if (drain_lb_fds(fd) < 0) {
+					epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+					close(fd);
+					remove_lb_conn(fd);
 				}
 				continue;
 			}
