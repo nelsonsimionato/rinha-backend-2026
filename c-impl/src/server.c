@@ -20,6 +20,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "http.h"
@@ -303,6 +304,34 @@ void server_warmup(int n_queries)
 	fprintf(stderr, "server: warmup %d queries done\n", n_queries);
 }
 
+static inline uint64_t mono_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* Spin-before-block: poll epoll non-blocking; if nothing is ready and
+ * spin_us > 0, busy-spin (PAUSE) up to spin_us catching an imminent event
+ * with ZERO scheduler-wakeup latency, then fall back to a blocking wait
+ * (block_timeout ms). spin_us=0 → straight to the blocking wait (old behavior).
+ * Bounded spin keeps CPU burn tiny (~spin_us per idle gap). */
+static int epoll_wait_spin(int epfd, struct epoll_event *events, int maxev,
+                           int spin_us, int block_timeout)
+{
+	int n = epoll_wait(epfd, events, maxev, 0);
+	if (n != 0) return n;                  /* event ready (n>0) or error (n<0) */
+	if (spin_us > 0) {
+		uint64_t deadline = mono_ns() + (uint64_t)spin_us * 1000ull;
+		do {
+			__builtin_ia32_pause();
+			n = epoll_wait(epfd, events, maxev, 0);
+			if (n != 0) return n;
+		} while (mono_ns() < deadline);
+	}
+	return epoll_wait(epfd, events, maxev, block_timeout);
+}
+
 int server_run(int port)
 {
 	signal(SIGTERM, on_signal);
@@ -313,6 +342,12 @@ int server_run(int port)
 	 * every 1ms to keep a pinned core/vCPU out of deep idle. */
 	const char *et = getenv("EPOLL_TIMEOUT_MS");
 	int epoll_timeout = (et && et[0]) ? atoi(et) : -1;
+
+	/* Spin-before-block window (µs). Default 0 = disabled (block immediately).
+	 * SPIN_US=50 busy-polls up to 50µs to catch imminent requests with no
+	 * scheduler-wakeup latency (the lever the fastest leaderboard entries use). */
+	const char *spv = getenv("SPIN_US");
+	int spin_us = (spv && spv[0]) ? atoi(spv) : 0;
 
 	for (int i = 0; i < MAX_CONNECTIONS; i++) conns[i].fd = -1;
 
@@ -344,7 +379,7 @@ int server_run(int port)
 	struct epoll_event events[64];
 
 	while (!stop_flag) {
-		int n = epoll_wait(epfd, events, 64, epoll_timeout);
+		int n = epoll_wait_spin(epfd, events, 64, spin_us, epoll_timeout);
 		if (n < 0) {
 			if (errno == EINTR) continue;
 			perror("epoll_wait");
