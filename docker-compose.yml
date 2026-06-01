@@ -27,7 +27,7 @@ services:
   # Budget: 0.50 (haproxy) + 2×0.25 (api) = 1.0 CPU, 30 + 2×160 = 350 MB.
   # Each API holds the full i16 index (no sharding); haproxy round-robins.
   api1: &api
-    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.15-i16
+    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.17-s10k
     deploy:
       resources:
         limits:
