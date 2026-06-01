@@ -34,7 +34,7 @@ services:
         condition: service_healthy
 
   api1: &api
-    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.19-fd
+    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.18-fd
     environment:
       - FDSOCK=/sock/api1.sock
     volumes:
