@@ -59,6 +59,7 @@ typedef enum {
 typedef struct {
 	int       fd;          /* -1 = slot free */
 	ConnState state;
+	int       out_armed;   /* EPOLLOUT registered (partial send pending) */
 	int       read_len;
 	char      read_buf[READ_BUF_SIZE + 64]; /* +64 slack for line scans */
 	const char *write_ptr;
@@ -69,6 +70,12 @@ static Conn  conns[MAX_CONNECTIONS];
 static int   epfd = -1;
 static int   g_busy_poll_us = 0;    /* BUSY_POLL_US: SO_BUSY_POLL on client fds (0 = off) */
 static int   listen_fd = -1;
+
+/* O(1) fd -> conn slot map. The old per-event linear scan over the 256-slot
+ * pool walked ~half the pool in 8KB strides before EVERY request — guaranteed
+ * L1/L2 eviction right before the AVX2 KNN runs on the same core. */
+#define FD_MAP_MAX 65536
+static int32_t conn_by_fd[FD_MAP_MAX];
 static int   unix_listen_fd = -1;   /* AF_UNIX listener for LB FD handoff (optional) */
 static int   lb_conn[8];            /* connected LB handoff channels (FD sources) */
 static int   n_lb_conn = 0;
@@ -87,15 +94,18 @@ static void conn_close(Conn *c)
 {
 	if (c->fd >= 0) {
 		epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
+		if (c->fd < FD_MAP_MAX) conn_by_fd[c->fd] = -1;
 		close(c->fd);
 		c->fd = -1;
 	}
 }
 
+/* Reset write state for the next request. Deliberately does NOT touch
+ * read_len: bytes of a pipelined next request already buffered stay valid.
+ * (Fresh connections zero read_len in accept_client_fd.) */
 static void conn_reset_for_next(Conn *c)
 {
 	c->state           = CS_READING;
-	c->read_len        = 0;
 	c->write_ptr       = NULL;
 	c->write_remaining = 0;
 }
@@ -122,11 +132,21 @@ static void accept_client_fd(int cfd)
 		}
 	}
 	conns[slot].fd = cfd;
+	conns[slot].read_len  = 0;
+	conns[slot].out_armed = 0;
 	conn_reset_for_next(&conns[slot]);
+	/* Level-triggered, EPOLLIN only. LT means a single short recv per request
+	 * suffices (no drain-to-EAGAIN second recv); EPOLLOUT is armed on demand
+	 * only when a send returns partial/EAGAIN (see on_writable). */
 	struct epoll_event cev = {0};
-	cev.events  = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
+	cev.events  = EPOLLIN | EPOLLRDHUP;
 	cev.data.fd = cfd;
-	if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0) { close(cfd); conns[slot].fd = -1; }
+	if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0) { close(cfd); conns[slot].fd = -1; return; }
+	if (cfd < FD_MAP_MAX) conn_by_fd[cfd] = (int32_t)slot;
+	else { /* fd beyond map (impossible at our scale): fail safe */
+		epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, NULL);
+		close(cfd); conns[slot].fd = -1;
+	}
 }
 
 /* Queue a response (pointer + length) for write. The buffer is static,
@@ -173,21 +193,27 @@ static void handle_request(Conn *c, HttpRequest *req)
 	queue_write(c, HTTP_RESPONSES[fraud], HTTP_RESPONSES_LEN[fraud]);
 }
 
-/* Drain everything possible from the read side; on each complete request,
- * stage a response, switch to writing. */
+static void on_writable(Conn *c);
+
+/* Read what's available; on a complete request, stage a response and switch
+ * to writing. Level-triggered epoll: one recv per wakeup is enough — a short
+ * read means the socket buffer is drained (no EAGAIN-probe second recv);
+ * only loop if recv filled our window exactly (possible more pending). */
 static void on_readable(Conn *c)
 {
 	for (;;) {
-		ssize_t n = recv(c->fd, c->read_buf + c->read_len,
-		                 READ_BUF_SIZE - c->read_len, 0);
+		int cap = READ_BUF_SIZE - c->read_len;
+		ssize_t n = recv(c->fd, c->read_buf + c->read_len, (size_t)cap, 0);
 		if (n > 0) {
 			c->read_len += (int)n;
 			if (c->read_len >= READ_BUF_SIZE) {
-				/* Oversized request: safe fallback and close. */
+				/* Oversized request: flush, safe fallback (tail-send below). */
+				c->read_len = 0;
 				queue_write(c, HTTP_RESPONSES[0], HTTP_RESPONSES_LEN[0]);
-				return;
+				break;
 			}
-			continue;
+			if ((int)n < cap) break;   /* short read: drained */
+			continue;                  /* filled window: more may be pending */
 		}
 		if (n == 0) { conn_close(c); return; }
 		if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -195,20 +221,22 @@ static void on_readable(Conn *c)
 		return;
 	}
 
-	/* Process as many complete requests as possible (pipelining). */
+	/* Process one complete request if present (next ones resume post-write). */
 	while (c->read_len > 0 && c->state == CS_READING) {
 		HttpRequest req;
 		int rc = http_parse_headers(c->read_buf, c->read_len, &req);
 		if (rc == 0) break;        /* need more data */
 		if (rc < 0) {
-			/* malformed headers: safe fallback, then drop conn after write */
+			/* Malformed headers: flush the garbage, send safe fallback. */
+			c->read_len = 0;
 			queue_write(c, HTTP_RESPONSES[0], HTTP_RESPONSES_LEN[0]);
-			return;
+			break;
 		}
 		int total = req.headers_len + req.content_length;
 		if (total > READ_BUF_SIZE) {
+			c->read_len = 0;
 			queue_write(c, HTTP_RESPONSES[0], HTTP_RESPONSES_LEN[0]);
-			return;
+			break;
 		}
 		if (c->read_len < total) break; /* body still arriving */
 		if (req.content_length > 0) http_set_body(&req, c->read_buf);
@@ -222,6 +250,22 @@ static void on_readable(Conn *c)
 		c->read_len = leftover;
 		break; /* one request at a time; resume after write completes */
 	}
+
+	/* Inline first send: EPOLLOUT is not armed on the fast path, so the
+	 * response goes out in this same call stack (LT arms EPOLLOUT only if
+	 * the send comes back partial). */
+	if (c->fd >= 0 && c->state == CS_WRITING)
+		on_writable(c);
+}
+
+static void epollout_arm(Conn *c, int on)
+{
+	if (c->out_armed == on) return;
+	struct epoll_event ev = {0};
+	ev.events  = EPOLLIN | EPOLLRDHUP | (on ? EPOLLOUT : 0);
+	ev.data.fd = c->fd;
+	if (epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev) == 0)
+		c->out_armed = on;
 }
 
 static void on_writable(Conn *c)
@@ -234,16 +278,21 @@ static void on_writable(Conn *c)
 			continue;
 		}
 		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-			/* Will be re-armed by EPOLLET on next writable event. */
+			/* Kernel buffer full (rare: responses are ~130B). Level-triggered:
+			 * arm EPOLLOUT and resume on the writable event. */
+			epollout_arm(c, 1);
 			return;
 		}
 		conn_close(c);
 		return;
 	}
 	/* Response fully sent; keep-alive — go back to reading. */
+	if (c->out_armed) epollout_arm(c, 0);
 	conn_reset_for_next(c);
-	/* Re-arm: edge-triggered means we may have pipelined data already buffered. */
-	on_readable(c);
+	/* Pipelined data already buffered in userspace is invisible to epoll —
+	 * process it now. Empty buffer: just return; LT fires on the next bytes. */
+	if (c->read_len > 0)
+		on_readable(c);
 }
 
 static int setup_listener(int port)
@@ -435,6 +484,7 @@ int server_run(int port)
 	}
 
 	for (int i = 0; i < MAX_CONNECTIONS; i++) conns[i].fd = -1;
+	for (int i = 0; i < FD_MAP_MAX; i++) conn_by_fd[i] = -1;
 
 	listen_fd = setup_listener(port);
 	if (listen_fd < 0) { perror("listen"); return -1; }
@@ -537,11 +587,11 @@ int server_run(int port)
 				continue;
 			}
 
-			/* Find the connection slot for this fd. */
+			/* O(1) fd -> connection slot. */
 			Conn *c = NULL;
-			for (int s = 0; s < MAX_CONNECTIONS; s++)
-				if (conns[s].fd == fd) { c = &conns[s]; break; }
-			if (!c) {
+			if (fd >= 0 && fd < FD_MAP_MAX && conn_by_fd[fd] >= 0)
+				c = &conns[conn_by_fd[fd]];
+			if (!c || c->fd != fd) {
 				/* Stale event: defensively unregister. */
 				epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
 				close(fd);
@@ -552,11 +602,12 @@ int server_run(int port)
 				conn_close(c);
 				continue;
 			}
-			if (c->state == CS_READING && (events[i].events & EPOLLIN)) {
-				on_readable(c);
-			}
 			if (c->state == CS_WRITING && (events[i].events & EPOLLOUT)) {
+				/* Partial-send resume (EPOLLOUT armed on demand). */
 				on_writable(c);
+			}
+			if (c->fd >= 0 && c->state == CS_READING && (events[i].events & EPOLLIN)) {
+				on_readable(c);
 			}
 		}
 	}
