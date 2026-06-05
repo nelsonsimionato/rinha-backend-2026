@@ -1,11 +1,18 @@
-# v0.23: v0.22 (warmup + EPOLL_TIMEOUT_MS=1 + SPIN_US=50) + cpuset RELAYOUT 1/2/3.
-# api1->cpu1, api2->cpu2, lb->cpu3 — leaving cpu0 free for the OS/IRQs and the
-# k6 load generator. This is the layout SrPatoS's C backend uses to hit 0.87ms.
-# Our earlier cpuset attempt (v0.20) regressed because it used 0/1/2,3, which
-# parked api1 on the IRQ-busy cpu0 and put the LB on the APIs' HT siblings.
-# Single-submission probe; revert to v0.22 if it regresses.
-# Image v0.22-fd-spin (unchanged). cpus 0.45/0.45/0.10 = 1.0, mem 350MB; cpuset
-# is placement, not quota — does not count against the 1-CPU limit.
+# v0.24: v0.23 (warmup + EPOLL_TIMEOUT_MS=1 + SPIN_US=50 + cpuset 1/2/3) +
+# KEEP-WARM serving loop + LB DEFER_ACCEPT. Copied from the #1 preview entry's
+# annotated recipe (chrisamora-c, 0.301ms): EPOLL_IDLE_US=60 blocks in
+# epoll_pwait2 with a 60µs timeout and re-blocks on timeout, so the pinned core
+# never predicts >60µs idle -> cpuidle stays in shallow C1 (no C3/C6 exit,
+# ~30-100µs on Haswell) and intel_pstate keeps the clock up. Cost ~2-3% CPU,
+# load-INVARIANT (cannot trip the CFS quota on the heavier final script —
+# validated locally at 2500 req/s: 0 throttles, E=0). SPIN_US now spins only
+# right after processed events (idle ticks sleep), so v0.24 uses LESS CPU than
+# v0.23 overall. LB DEFER_ACCEPT=1: accept wakes only when the first request
+# bytes arrived -> handed-off fd is instantly readable (kills the new-conn
+# double-wakeup ~14ms tail). Fallbacks: pwait2 ENOSYS -> EPOLL_TIMEOUT_MS=1.
+# cpuset 1/2/3 unchanged (proven 0.422ms): APIs on cpu1/cpu2, LB on cpu3,
+# cpu0 free for OS/IRQs/k6. cpus 0.45/0.45/0.10 = 1.0, mem 350MB.
+# Revert to v0.23 (956a0a3) if the preview regresses.
 networks:
   rinha_net:
     driver: bridge
@@ -14,8 +21,10 @@ volumes:
 
 services:
   lb:
-    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.18-lbfd
+    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.24-lbfd
     command: ["--port", "9999", "/sock/api1.sock", "/sock/api2.sock"]
+    environment:
+      - DEFER_ACCEPT=1
     ports:
       - "9999:9999"
     volumes:
@@ -35,12 +44,13 @@ services:
         condition: service_healthy
 
   api1: &api
-    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.22-fd-spin
+    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.24-keepwarm
     environment:
       - FDSOCK=/sock/api1.sock
       - EPOLL_TIMEOUT_MS=1
       - WARMUP_QUERIES=5000
       - SPIN_US=50
+      - EPOLL_IDLE_US=60
     volumes:
       - sock:/sock
     cpuset: "1"
@@ -66,3 +76,4 @@ services:
       - EPOLL_TIMEOUT_MS=1
       - WARMUP_QUERIES=5000
       - SPIN_US=50
+      - EPOLL_IDLE_US=60
