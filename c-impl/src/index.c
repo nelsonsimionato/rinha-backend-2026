@@ -1,5 +1,8 @@
+#include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -42,6 +45,50 @@ int index_load(const char *path)
 	if (p == MAP_FAILED) {
 		fprintf(stderr, "index_load: mmap failed\n");
 		return -1;
+	}
+
+	/* INDEX_HUGE=1: copy the index into an anonymous MADV_HUGEPAGE region.
+	 * File-backed mappings cannot use THP; an anon copy lets the kernel back
+	 * the 118MB working set with 2MB pages instead of ~29k 4KB pages —
+	 * collapsing dTLB misses + page walks on every random KD-tree descent.
+	 * Needs host THP mode "madvise" or "always" (Ubuntu default: madvise);
+	 * degrades to the plain file mapping on any failure. */
+	const char *eh = getenv("INDEX_HUGE");
+	if (eh && eh[0] == '1') {
+		size_t align = 2UL << 20;
+		size_t sz2m  = (size + align - 1) & ~(align - 1);
+		void *raw = mmap(NULL, sz2m + align, PROT_READ | PROT_WRITE,
+		                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (raw != MAP_FAILED) {
+			uintptr_t base    = ((uintptr_t)raw + align - 1) & ~(uintptr_t)(align - 1);
+			size_t    headcut = (size_t)(base - (uintptr_t)raw);
+			if (headcut)                  munmap(raw, headcut);
+			if (align - headcut)          munmap((void *)(base + sz2m), align - headcut);
+			void *anon = (void *)base;
+			if (madvise(anon, sz2m, MADV_HUGEPAGE) != 0)
+				fprintf(stderr, "index_load: MADV_HUGEPAGE unavailable (%s), copying anyway\n",
+				        strerror(errno));
+			memcpy(anon, p, size);
+			if (mprotect(anon, sz2m, PROT_READ) != 0) { /* keep read-only discipline */ }
+			munmap(p, size);
+			p = anon;
+			fprintf(stderr, "index_load: index copied to anon region (THP requested)\n");
+		} else {
+			fprintf(stderr, "index_load: anon alloc failed (%s), using file mapping\n",
+			        strerror(errno));
+		}
+	}
+
+	/* INDEX_MLOCK=1: pin the index so clean pages can never be reclaimed and
+	 * refaulted mid-request (tail spikes). Requires RLIMIT_MEMLOCK raised via
+	 * compose ulimits (memlock: -1); logged no-op otherwise. */
+	const char *em = getenv("INDEX_MLOCK");
+	if (em && em[0] == '1') {
+		if (mlock(p, size) == 0)
+			fprintf(stderr, "index_load: mlock(%zu MB) ok\n", size >> 20);
+		else
+			fprintf(stderr, "index_load: mlock failed (%s), continuing unlocked\n",
+			        strerror(errno));
 	}
 
 	const uint8_t *buf = (const uint8_t *)p;
