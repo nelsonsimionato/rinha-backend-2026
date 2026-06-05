@@ -1,4 +1,4 @@
-# v0.24: v0.23 (warmup + EPOLL_TIMEOUT_MS=1 + SPIN_US=50 + cpuset 1/2/3) +
+# v0.24: v0.23 (warmup + EPOLL_TIMEOUT_MS=1 + SPIN_US=0 + cpuset 1/2/3) +
 # KEEP-WARM serving loop + LB DEFER_ACCEPT. Copied from the #1 preview entry's
 # annotated recipe (chrisamora-c, 0.301ms): EPOLL_IDLE_US=60 blocks in
 # epoll_pwait2 with a 60µs timeout and re-blocks on timeout, so the pinned core
@@ -46,13 +46,14 @@ services:
         condition: service_healthy
 
   api1: &api
-    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.24-keepwarm
+    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.25-lean
     environment:
       - FDSOCK=/sock/api1.sock
       - EPOLL_TIMEOUT_MS=1
       - WARMUP_QUERIES=5000
-      - SPIN_US=50
+      - SPIN_US=0
       - EPOLL_IDLE_US=60
+      - BUSY_POLL_US=5
     volumes:
       - sock:/sock
     cpuset: "0"
@@ -77,5 +78,6 @@ services:
       - FDSOCK=/sock/api2.sock
       - EPOLL_TIMEOUT_MS=1
       - WARMUP_QUERIES=5000
-      - SPIN_US=50
+      - SPIN_US=0
       - EPOLL_IDLE_US=60
+      - BUSY_POLL_US=5
