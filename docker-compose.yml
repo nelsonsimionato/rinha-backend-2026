@@ -46,14 +46,20 @@ services:
         condition: service_healthy
 
   api1: &api
-    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.25-lean
+    image: docker.io/nelsonsimionato/rinha-backend-2026:v0.26-thp
     environment:
       - FDSOCK=/sock/api1.sock
       - EPOLL_TIMEOUT_MS=1
       - WARMUP_QUERIES=5000
       - SPIN_US=0
       - EPOLL_IDLE_US=60
+      - INDEX_HUGE=1
+      - INDEX_MLOCK=1
       - BUSY_POLL_US=5
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     volumes:
       - sock:/sock
     cpuset: "0"
@@ -80,4 +86,6 @@ services:
       - WARMUP_QUERIES=5000
       - SPIN_US=0
       - EPOLL_IDLE_US=60
+      - INDEX_HUGE=1
+      - INDEX_MLOCK=1
       - BUSY_POLL_US=5
