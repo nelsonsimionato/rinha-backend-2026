@@ -1,6 +1,6 @@
 # v0.24: v0.23 (warmup + EPOLL_TIMEOUT_MS=1 + SPIN_US=0 + cpuset 1/2/3) +
 # KEEP-WARM serving loop + LB DEFER_ACCEPT. Copied from the #1 preview entry's
-# annotated recipe (chrisamora-c, 0.301ms): EPOLL_IDLE_US=60 blocks in
+# annotated recipe (chrisamora-c, 0.301ms): EPOLL_IDLE_US=40 blocks in
 # epoll_pwait2 with a 60µs timeout and re-blocks on timeout, so the pinned core
 # never predicts >60µs idle -> cpuidle stays in shallow C1 (no C3/C6 exit,
 # ~30-100µs on Haswell) and intel_pstate keeps the clock up. Cost ~2-3% CPU,
@@ -52,7 +52,7 @@ services:
       - EPOLL_TIMEOUT_MS=1
       - WARMUP_QUERIES=5000
       - SPIN_US=0
-      - EPOLL_IDLE_US=60
+      - EPOLL_IDLE_US=40
       - BUSY_POLL_US=5
     volumes:
       - sock:/sock
@@ -79,5 +79,5 @@ services:
       - EPOLL_TIMEOUT_MS=1
       - WARMUP_QUERIES=5000
       - SPIN_US=0
-      - EPOLL_IDLE_US=60
+      - EPOLL_IDLE_US=40
       - BUSY_POLL_US=5
