@@ -10,9 +10,11 @@
 # v0.23 overall. LB DEFER_ACCEPT=1: accept wakes only when the first request
 # bytes arrived -> handed-off fd is instantly readable (kills the new-conn
 # double-wakeup ~14ms tail). Fallbacks: pwait2 ENOSYS -> EPOLL_TIMEOUT_MS=1.
-# cpuset 1/2/3 unchanged (proven 0.422ms): APIs on cpu1/cpu2, LB on cpu3,
-# cpu0 free for OS/IRQs/k6. cpus 0.45/0.45/0.10 = 1.0, mem 350MB.
-# Revert to v0.23 (956a0a3) if the preview regresses.
+# v0.24c LAYOUT PROBE: APIs on cpu0/cpu1 (one per physical core, primary
+# threads), LB on "2,3" (both HT siblings, 0.02 CPU) — the consensus layout
+# of preview #1 (chrisamora 0.301) and #2 (bmtec 0.337, SAME keep-warm
+# mechanism as ours -> layout is the remaining delta). cpus 0.49/0.49/0.02.
+# Revert to a7fa5c0 (v0.24 @ 0.414, layout 1/2/3) if this regresses.
 networks:
   rinha_net:
     driver: bridge
@@ -29,11 +31,11 @@ services:
       - "9999:9999"
     volumes:
       - sock:/sock
-    cpuset: "3"
+    cpuset: "2,3"
     deploy:
       resources:
         limits:
-          cpus: '0.10'
+          cpus: '0.02'
           memory: 30M
     networks:
       - rinha_net
@@ -53,11 +55,11 @@ services:
       - EPOLL_IDLE_US=60
     volumes:
       - sock:/sock
-    cpuset: "1"
+    cpuset: "0"
     deploy:
       resources:
         limits:
-          cpus: '0.45'
+          cpus: '0.49'
           memory: 160M
     networks:
       - rinha_net
@@ -70,7 +72,7 @@ services:
 
   api2:
     <<: *api
-    cpuset: "2"
+    cpuset: "1"
     environment:
       - FDSOCK=/sock/api2.sock
       - EPOLL_TIMEOUT_MS=1
