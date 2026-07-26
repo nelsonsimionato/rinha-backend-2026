@@ -1,5 +1,6 @@
 #include "search.h"
 #include "distance.h"
+#include "distance_chunk.h"
 #include "index.h"
 
 STATIC_ASSERT(sizeof(KDNode) == KD_NODE_BYTES, "KDNode must be 40 bytes (on-disk layout)");
@@ -47,6 +48,71 @@ ALWAYS_INLINE void scan_leaf(const int16_t *query, uint32_t start, uint32_t coun
 	}
 }
 
+/* ---- SEARCH_V2 path: identical traversal and pruning over the split node
+ * arrays (one 64B line per bound check) + 8-record SoA chunk leaf scans. ---- */
+
+/* Chunks ahead to prefetch (224B each = 3.5 lines). */
+#define CHUNK_PREFETCH 2
+
+ALWAYS_INLINE void scan_leaf_v2(const int32_t qp[7], uint32_t leaf_idx,
+                                SearchState *st)
+{
+	const LeafDesc  *ld   = &g_leaf_desc[leaf_idx];
+	const LeafChunk *base = &g_leaf_chunks[ld->chunk_first];
+	uint32_t nchunks   = (ld->count + 7u) >> 3;
+	uint32_t rec       = ld->rec_base;
+	uint32_t remaining = ld->count;
+	for (uint32_t c = 0; c < nchunks; c++) {
+		__builtin_prefetch(&base[c + CHUNK_PREFETCH], 0, 1);
+		uint32_t d[8];
+		chunk_distances(qp, &base[c], d);
+		uint32_t lanes = remaining < 8u ? remaining : 8u;
+		for (uint32_t j = 0; j < lanes; j++)
+			knn_push(st, d[j], (int32_t)(rec + j));
+		rec       += 8u;
+		remaining -= lanes;
+	}
+}
+
+static void search_knn_v2(const int16_t query[RECORD_STRIDE], SearchState *st,
+                          Neighbor out[K])
+{
+	int32_t qp[7];
+	chunk_prepack_query(query, qp);
+
+	int sp = 0;
+	st->stack[sp++] = 0; /* root */
+
+	while (sp > 0) {
+		uint32_t ni = st->stack[--sp];
+		const NodeBounds *nb = &g_node_bounds[ni];
+
+		if (st->q_count >= K) {
+			uint32_t b = bound_dist_sq(query, nb->bmin, nb->bmax);
+			if (b >= st->q[K-1].dist_sq) continue;
+		}
+
+		const NodeKids *nk = &g_node_kids[ni];
+		if (nk->b & KD_LEAF_FLAG) {
+			scan_leaf_v2(qp, nk->a, st);
+			continue;
+		}
+
+		uint32_t L = nk->a, R = nk->b;
+		uint32_t bl = bound_dist_sq(query, g_node_bounds[L].bmin, g_node_bounds[L].bmax);
+		uint32_t br = bound_dist_sq(query, g_node_bounds[R].bmin, g_node_bounds[R].bmax);
+		if (bl <= br) {
+			st->stack[sp++] = R;
+			st->stack[sp++] = L;
+		} else {
+			st->stack[sp++] = L;
+			st->stack[sp++] = R;
+		}
+	}
+
+	for (int i = 0; i < K; i++) out[i] = st->q[i];
+}
+
 /* Exact KD k-NN. Iterative best-effort DFS: at each internal node, descend the
  * child whose bounding box is nearer first (tightens the K-th distance early),
  * and prune a node when its box lower-bound is already >= the current K-th.
@@ -57,6 +123,11 @@ void search_knn(const int16_t query[RECORD_STRIDE], SearchState *st,
 	st->q_count = 0;
 	if (UNLIKELY(kd_node_count == 0)) {
 		for (int i = 0; i < K; i++) { out[i].dist_sq = ~0u; out[i].node_idx = 0; }
+		return;
+	}
+
+	if (g_search_v2) {
+		search_knn_v2(query, st, out);
 		return;
 	}
 

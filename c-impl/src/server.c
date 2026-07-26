@@ -14,14 +14,35 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef __NR_epoll_pwait2
+#define __NR_epoll_pwait2 441   /* x86_64; kernel >= 5.11 */
+#endif
+
+/* epoll busy-poll params ioctl (kernel >= 6.9). Declared locally because the
+ * debian 12 build headers (6.1) predate it. Setting it on an older kernel just
+ * fails with ENOTTY (and unprivileged may get EPERM) — logged, then ignored. */
+struct epoll_params_compat {
+	uint32_t busy_poll_usecs;
+	uint16_t busy_poll_budget;
+	uint8_t  prefer_busy_poll;
+	uint8_t  __pad;
+};
+#ifndef EPIOCSPARAMS
+#define EPIOCSPARAMS _IOW(0x8A, 0x01, struct epoll_params_compat)
+#endif
 
 #include "http.h"
 #include "json.h"
@@ -38,6 +59,7 @@ typedef enum {
 typedef struct {
 	int       fd;          /* -1 = slot free */
 	ConnState state;
+	int       out_armed;   /* EPOLLOUT registered (partial send pending) */
 	int       read_len;
 	char      read_buf[READ_BUF_SIZE + 64]; /* +64 slack for line scans */
 	const char *write_ptr;
@@ -46,7 +68,14 @@ typedef struct {
 
 static Conn  conns[MAX_CONNECTIONS];
 static int   epfd = -1;
+static int   g_busy_poll_us = 0;    /* BUSY_POLL_US: SO_BUSY_POLL on client fds (0 = off) */
 static int   listen_fd = -1;
+
+/* O(1) fd -> conn slot map. The old per-event linear scan over the 256-slot
+ * pool walked ~half the pool in 8KB strides before EVERY request — guaranteed
+ * L1/L2 eviction right before the AVX2 KNN runs on the same core. */
+#define FD_MAP_MAX 65536
+static int32_t conn_by_fd[FD_MAP_MAX];
 static int   unix_listen_fd = -1;   /* AF_UNIX listener for LB FD handoff (optional) */
 static int   lb_conn[8];            /* connected LB handoff channels (FD sources) */
 static int   n_lb_conn = 0;
@@ -65,15 +94,18 @@ static void conn_close(Conn *c)
 {
 	if (c->fd >= 0) {
 		epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
+		if (c->fd < FD_MAP_MAX) conn_by_fd[c->fd] = -1;
 		close(c->fd);
 		c->fd = -1;
 	}
 }
 
+/* Reset write state for the next request. Deliberately does NOT touch
+ * read_len: bytes of a pipelined next request already buffered stay valid.
+ * (Fresh connections zero read_len in accept_client_fd.) */
 static void conn_reset_for_next(Conn *c)
 {
 	c->state           = CS_READING;
-	c->read_len        = 0;
 	c->write_ptr       = NULL;
 	c->write_remaining = 0;
 }
@@ -88,12 +120,33 @@ static void accept_client_fd(int cfd)
 	if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);  /* ET epoll needs nonblock */
 	int one = 1;
 	setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+	if (g_busy_poll_us > 0) {
+		/* Best-effort: in-kernel NAPI busy poll on read. Unprivileged
+		 * containers typically get EPERM (needs CAP_NET_ADMIN) — fine. */
+		static int logged = 0;
+		if (setsockopt(cfd, SOL_SOCKET, SO_BUSY_POLL,
+		               &g_busy_poll_us, sizeof(g_busy_poll_us)) < 0 && !logged) {
+			logged = 1;
+			fprintf(stderr, "server: SO_BUSY_POLL unavailable (%s), continuing without\n",
+			        strerror(errno));
+		}
+	}
 	conns[slot].fd = cfd;
+	conns[slot].read_len  = 0;
+	conns[slot].out_armed = 0;
 	conn_reset_for_next(&conns[slot]);
+	/* Level-triggered, EPOLLIN only. LT means a single short recv per request
+	 * suffices (no drain-to-EAGAIN second recv); EPOLLOUT is armed on demand
+	 * only when a send returns partial/EAGAIN (see on_writable). */
 	struct epoll_event cev = {0};
-	cev.events  = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP;
+	cev.events  = EPOLLIN | EPOLLRDHUP;
 	cev.data.fd = cfd;
-	if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0) { close(cfd); conns[slot].fd = -1; }
+	if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0) { close(cfd); conns[slot].fd = -1; return; }
+	if (cfd < FD_MAP_MAX) conn_by_fd[cfd] = (int32_t)slot;
+	else { /* fd beyond map (impossible at our scale): fail safe */
+		epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, NULL);
+		close(cfd); conns[slot].fd = -1;
+	}
 }
 
 /* Queue a response (pointer + length) for write. The buffer is static,
@@ -140,21 +193,27 @@ static void handle_request(Conn *c, HttpRequest *req)
 	queue_write(c, HTTP_RESPONSES[fraud], HTTP_RESPONSES_LEN[fraud]);
 }
 
-/* Drain everything possible from the read side; on each complete request,
- * stage a response, switch to writing. */
+static void on_writable(Conn *c);
+
+/* Read what's available; on a complete request, stage a response and switch
+ * to writing. Level-triggered epoll: one recv per wakeup is enough — a short
+ * read means the socket buffer is drained (no EAGAIN-probe second recv);
+ * only loop if recv filled our window exactly (possible more pending). */
 static void on_readable(Conn *c)
 {
 	for (;;) {
-		ssize_t n = recv(c->fd, c->read_buf + c->read_len,
-		                 READ_BUF_SIZE - c->read_len, 0);
+		int cap = READ_BUF_SIZE - c->read_len;
+		ssize_t n = recv(c->fd, c->read_buf + c->read_len, (size_t)cap, 0);
 		if (n > 0) {
 			c->read_len += (int)n;
 			if (c->read_len >= READ_BUF_SIZE) {
-				/* Oversized request: safe fallback and close. */
+				/* Oversized request: flush, safe fallback (tail-send below). */
+				c->read_len = 0;
 				queue_write(c, HTTP_RESPONSES[0], HTTP_RESPONSES_LEN[0]);
-				return;
+				break;
 			}
-			continue;
+			if ((int)n < cap) break;   /* short read: drained */
+			continue;                  /* filled window: more may be pending */
 		}
 		if (n == 0) { conn_close(c); return; }
 		if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -162,20 +221,22 @@ static void on_readable(Conn *c)
 		return;
 	}
 
-	/* Process as many complete requests as possible (pipelining). */
+	/* Process one complete request if present (next ones resume post-write). */
 	while (c->read_len > 0 && c->state == CS_READING) {
 		HttpRequest req;
 		int rc = http_parse_headers(c->read_buf, c->read_len, &req);
 		if (rc == 0) break;        /* need more data */
 		if (rc < 0) {
-			/* malformed headers: safe fallback, then drop conn after write */
+			/* Malformed headers: flush the garbage, send safe fallback. */
+			c->read_len = 0;
 			queue_write(c, HTTP_RESPONSES[0], HTTP_RESPONSES_LEN[0]);
-			return;
+			break;
 		}
 		int total = req.headers_len + req.content_length;
 		if (total > READ_BUF_SIZE) {
+			c->read_len = 0;
 			queue_write(c, HTTP_RESPONSES[0], HTTP_RESPONSES_LEN[0]);
-			return;
+			break;
 		}
 		if (c->read_len < total) break; /* body still arriving */
 		if (req.content_length > 0) http_set_body(&req, c->read_buf);
@@ -189,6 +250,22 @@ static void on_readable(Conn *c)
 		c->read_len = leftover;
 		break; /* one request at a time; resume after write completes */
 	}
+
+	/* Inline first send: EPOLLOUT is not armed on the fast path, so the
+	 * response goes out in this same call stack (LT arms EPOLLOUT only if
+	 * the send comes back partial). */
+	if (c->fd >= 0 && c->state == CS_WRITING)
+		on_writable(c);
+}
+
+static void epollout_arm(Conn *c, int on)
+{
+	if (c->out_armed == on) return;
+	struct epoll_event ev = {0};
+	ev.events  = EPOLLIN | EPOLLRDHUP | (on ? EPOLLOUT : 0);
+	ev.data.fd = c->fd;
+	if (epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev) == 0)
+		c->out_armed = on;
 }
 
 static void on_writable(Conn *c)
@@ -201,16 +278,21 @@ static void on_writable(Conn *c)
 			continue;
 		}
 		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-			/* Will be re-armed by EPOLLET on next writable event. */
+			/* Kernel buffer full (rare: responses are ~130B). Level-triggered:
+			 * arm EPOLLOUT and resume on the writable event. */
+			epollout_arm(c, 1);
 			return;
 		}
 		conn_close(c);
 		return;
 	}
 	/* Response fully sent; keep-alive — go back to reading. */
+	if (c->out_armed) epollout_arm(c, 0);
 	conn_reset_for_next(c);
-	/* Re-arm: edge-triggered means we may have pipelined data already buffered. */
-	on_readable(c);
+	/* Pipelined data already buffered in userspace is invisible to epoll —
+	 * process it now. Empty buffer: just return; LT fires on the next bytes. */
+	if (c->read_len > 0)
+		on_readable(c);
 }
 
 static int setup_listener(int port)
@@ -311,13 +393,49 @@ static inline uint64_t mono_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* Blocking wait. Two modes:
+ *
+ * - idle_us > 0 (EPOLL_IDLE_US, "keep-warm"): block in epoll_pwait2 with a
+ *   µs-granular timeout and immediately re-block on every timeout. The CPU
+ *   never predicts more than idle_us of idle, so the cpuidle governor stays
+ *   in shallow C1 instead of C3/C6 (Haswell exit ~30-100µs) and intel_pstate
+ *   keeps the core clocked. Every request wakeup then starts from a warm,
+ *   fast core. Cost at 60µs: ~16.7k timeouts/s × ~1µs ≈ 2% CPU when fully
+ *   idle, less under load — bounded regardless of request rate, so it can
+ *   never trip the CFS quota. Falls back to ms epoll_wait on ENOSYS.
+ *
+ * - idle_us == 0: original behavior — one blocking epoll_wait(block_timeout).
+ *
+ * Signals (SIGTERM) interrupt either wait with EINTR; caller re-checks
+ * stop_flag. */
+static int epoll_block(int epfd, struct epoll_event *events, int maxev,
+                       int idle_us, int block_timeout)
+{
+	static int pwait2_ok = 1;
+	if (idle_us > 0 && pwait2_ok) {
+		struct timespec ts;
+		ts.tv_sec  = idle_us / 1000000;
+		ts.tv_nsec = (long)(idle_us % 1000000) * 1000L;
+		for (;;) {
+			long n = syscall(__NR_epoll_pwait2, epfd, events, maxev,
+			                 &ts, NULL, (size_t)0);
+			if (n != 0) {
+				if (n < 0 && errno == ENOSYS) { pwait2_ok = 0; break; }
+				return (int)n;     /* events (n>0) or error inc. EINTR */
+			}
+			/* timeout with no events: re-block — this is the warm tick */
+		}
+	}
+	return epoll_wait(epfd, events, maxev, block_timeout);
+}
+
 /* Spin-before-block: poll epoll non-blocking; if nothing is ready and
  * spin_us > 0, busy-spin (PAUSE) up to spin_us catching an imminent event
- * with ZERO scheduler-wakeup latency, then fall back to a blocking wait
- * (block_timeout ms). spin_us=0 → straight to the blocking wait (old behavior).
+ * with ZERO scheduler-wakeup latency, then fall back to the blocking wait.
+ * spin_us=0 → straight to the blocking wait (old behavior).
  * Bounded spin keeps CPU burn tiny (~spin_us per idle gap). */
 static int epoll_wait_spin(int epfd, struct epoll_event *events, int maxev,
-                           int spin_us, int block_timeout)
+                           int spin_us, int block_timeout, int idle_us)
 {
 	int n = epoll_wait(epfd, events, maxev, 0);
 	if (n != 0) return n;                  /* event ready (n>0) or error (n<0) */
@@ -329,7 +447,7 @@ static int epoll_wait_spin(int epfd, struct epoll_event *events, int maxev,
 			if (n != 0) return n;
 		} while (mono_ns() < deadline);
 	}
-	return epoll_wait(epfd, events, maxev, block_timeout);
+	return epoll_block(epfd, events, maxev, idle_us, block_timeout);
 }
 
 int server_run(int port)
@@ -349,7 +467,24 @@ int server_run(int port)
 	const char *spv = getenv("SPIN_US");
 	int spin_us = (spv && spv[0]) ? atoi(spv) : 0;
 
+	/* Keep-warm blocking timeout (µs). 0 = off (block per EPOLL_TIMEOUT_MS).
+	 * EPOLL_IDLE_US=60 self-wakes every 60µs while idle so the pinned core
+	 * never enters deep C-states / drops frequency between requests. */
+	const char *iuv = getenv("EPOLL_IDLE_US");
+	int idle_us = (iuv && iuv[0]) ? atoi(iuv) : 0;
+
+	/* Optional in-kernel busy poll (best-effort; usually EPERM unprivileged). */
+	const char *bpv = getenv("BUSY_POLL_US");
+	g_busy_poll_us = (bpv && bpv[0]) ? atoi(bpv) : 0;
+
+	if (idle_us > 0) {
+		/* Default timer slack is 50µs; tighten so a 60µs epoll_pwait2 timeout
+		 * doesn't stretch toward C3-residency territory. Unprivileged-safe. */
+		prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);
+	}
+
 	for (int i = 0; i < MAX_CONNECTIONS; i++) conns[i].fd = -1;
+	for (int i = 0; i < FD_MAP_MAX; i++) conn_by_fd[i] = -1;
 
 	listen_fd = setup_listener(port);
 	if (listen_fd < 0) { perror("listen"); return -1; }
@@ -357,6 +492,22 @@ int server_run(int port)
 
 	epfd = epoll_create1(EPOLL_CLOEXEC);
 	if (epfd < 0) { perror("epoll_create1"); return -1; }
+
+	if (g_busy_poll_us > 0) {
+		/* epoll-integrated NAPI busy poll (kernel >= 6.9). Best-effort. */
+		struct epoll_params_compat ep = {0};
+		ep.busy_poll_usecs  = (uint32_t)g_busy_poll_us;
+		ep.busy_poll_budget = 8;
+		ep.prefer_busy_poll = 1;
+		if (ioctl(epfd, EPIOCSPARAMS, &ep) < 0)
+			fprintf(stderr, "server: EPIOCSPARAMS unavailable (%s), continuing without\n",
+			        strerror(errno));
+		else
+			fprintf(stderr, "server: epoll busy_poll=%dus budget=8 prefer=1\n",
+			        g_busy_poll_us);
+	}
+	fprintf(stderr, "server: wait config spin_us=%d idle_us=%d timeout_ms=%d busy_poll_us=%d\n",
+	        spin_us, idle_us, epoll_timeout, g_busy_poll_us);
 
 	struct epoll_event ev = {0};
 	ev.events  = EPOLLIN;
@@ -378,13 +529,21 @@ int server_run(int port)
 
 	struct epoll_event events[64];
 
+	/* With keep-warm on, spin only right after a processed batch (to catch an
+	 * imminent follow-up), NOT on every idle tick — spinning per 60µs tick
+	 * would burn spin/(spin+idle) ≈ 45% CPU while idle and risk the quota.
+	 * With keep-warm off, spin on every wake (exact v0.23 behavior). */
+	int had_events = 1;
+
 	while (!stop_flag) {
-		int n = epoll_wait_spin(epfd, events, 64, spin_us, epoll_timeout);
+		int eff_spin = (idle_us > 0 && !had_events) ? 0 : spin_us;
+		int n = epoll_wait_spin(epfd, events, 64, eff_spin, epoll_timeout, idle_us);
 		if (n < 0) {
 			if (errno == EINTR) continue;
 			perror("epoll_wait");
 			break;
 		}
+		had_events = (n > 0);
 		for (int i = 0; i < n; i++) {
 			int fd = events[i].data.fd;
 
@@ -428,11 +587,11 @@ int server_run(int port)
 				continue;
 			}
 
-			/* Find the connection slot for this fd. */
+			/* O(1) fd -> connection slot. */
 			Conn *c = NULL;
-			for (int s = 0; s < MAX_CONNECTIONS; s++)
-				if (conns[s].fd == fd) { c = &conns[s]; break; }
-			if (!c) {
+			if (fd >= 0 && fd < FD_MAP_MAX && conn_by_fd[fd] >= 0)
+				c = &conns[conn_by_fd[fd]];
+			if (!c || c->fd != fd) {
 				/* Stale event: defensively unregister. */
 				epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
 				close(fd);
@@ -443,11 +602,12 @@ int server_run(int port)
 				conn_close(c);
 				continue;
 			}
-			if (c->state == CS_READING && (events[i].events & EPOLLIN)) {
-				on_readable(c);
-			}
 			if (c->state == CS_WRITING && (events[i].events & EPOLLOUT)) {
+				/* Partial-send resume (EPOLLOUT armed on demand). */
 				on_writable(c);
+			}
+			if (c->fd >= 0 && c->state == CS_READING && (events[i].events & EPOLLIN)) {
+				on_readable(c);
 			}
 		}
 	}

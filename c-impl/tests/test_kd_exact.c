@@ -44,7 +44,12 @@ static void brute_top5(const int16_t *q, uint32_t dists[K], int fraud_out[1])
 int main(int argc, char **argv)
 {
 	int Q = (argc > 1) ? atoi(argv[1]) : 500;
+	/* Build the SEARCH_V2 arrays too: every query is checked 3-way
+	 * (brute force / v1 / v2). The flag is toggled per call below. */
+	setenv("SEARCH_V2", "1", 1);
 	if (index_load("../resources/index.bin") != 0) { fprintf(stderr,"load failed\n"); return 1; }
+	int have_v2 = g_search_v2;
+	if (!have_v2) fprintf(stderr, "WARN: SEARCH_V2 arrays unavailable, v2 checks skipped\n");
 
 	srand(20260531);
 	uint32_t n = total_records;
@@ -68,32 +73,49 @@ int main(int argc, char **argv)
 			}
 		}
 
+		g_search_v2 = 0;                      /* v1 path */
 		search_knn(q, &st, out);
 		uint32_t kd_d[K]; int kd_f = 0;
 		for (int i = 0; i < K; i++) { kd_d[i] = out[i].dist_sq; kd_f += is_fraud[out[i].node_idx]; }
+
+		uint32_t v2_d[K]; int v2_f = 0;
+		if (have_v2) {
+			g_search_v2 = 1;                  /* v2 path */
+			Neighbor out2[K];
+			search_knn(q, &st, out2);
+			for (int i = 0; i < K; i++) { v2_d[i] = out2[i].dist_sq; v2_f += is_fraud[out2[i].node_idx]; }
+		}
 
 		uint32_t bf_d[K]; int bf_f;
 		brute_top5(q, bf_d, &bf_f);
 
 		int dm = 0;
 		for (int i = 0; i < K; i++) if (kd_d[i] != bf_d[i]) dm = 1;
+		if (have_v2)
+			for (int i = 0; i < K; i++) if (v2_d[i] != bf_d[i]) dm = 1;
 		if (dm) {
 			dist_mismatch++;
 			if (dist_mismatch <= 5) {
 				fprintf(stderr, "DIST MISMATCH q#%d row=%u\n  kd =", t, row);
 				for (int i=0;i<K;i++) fprintf(stderr," %u",kd_d[i]);
+				if (have_v2) {
+					fprintf(stderr, "\n  v2 =");
+					for (int i=0;i<K;i++) fprintf(stderr," %u",v2_d[i]);
+				}
 				fprintf(stderr, "\n  bf =");
 				for (int i=0;i<K;i++) fprintf(stderr," %u",bf_d[i]);
 				fprintf(stderr, "\n");
 			}
 		}
 		if (kd_f != bf_f) fraud_mismatch++;
+		if (have_v2 && v2_f != bf_f) fraud_mismatch++;
 	}
 
-	printf("KD-vs-bruteforce over %d queries: dist-set mismatches=%d, fraud-count mismatches=%d\n",
-	       Q, dist_mismatch, fraud_mismatch);
-	if (dist_mismatch == 0) {
-		printf("EXACT RECALL CONFIRMED — KD-tree returns identical 5-NN distances to brute force.\n");
+	printf("KD-vs-bruteforce over %d queries (%s): dist-set mismatches=%d, fraud-count mismatches=%d\n",
+	       Q, have_v2 ? "v1+v2 both checked" : "v1 only", dist_mismatch, fraud_mismatch);
+	if (dist_mismatch == 0 && fraud_mismatch == 0) {
+		printf("EXACT RECALL CONFIRMED — %s return identical 5-NN distances to brute force.\n",
+		       have_v2 ? "v1 AND v2 paths" : "KD-tree");
 		return 0;
 	}
 	printf("FAIL: KD search is NOT exact.\n");

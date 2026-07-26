@@ -80,6 +80,15 @@ static int setup_listener(int port)
 	if (fd < 0) return -1;
 	int one = 1;
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	/* DEFER_ACCEPT=N (seconds): the kernel completes the handshake but only
+	 * wakes accept4 once the first request bytes arrive. The handed-off fd
+	 * then has data already readable, so the API's first read never waits for
+	 * a second wakeup (kills the new-connection double-wakeup tail). k6 always
+	 * writes immediately after connect. Default off; enable via env. */
+	const char *da = getenv("DEFER_ACCEPT");
+	int defer_s = (da && da[0]) ? atoi(da) : 0;
+	if (defer_s > 0)
+		setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_s, sizeof(defer_s));
 	struct sockaddr_in addr = {0};
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
