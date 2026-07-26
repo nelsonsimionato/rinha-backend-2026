@@ -22,7 +22,7 @@ Resultado final da edição 2026, publicado em [rinhadebackend.com.br](https://r
 | Detecção | 0 falsos positivos, 0 falsos negativos, 0 erros HTTP em 50.000 requisições |
 | Configuração avaliada | commit `dbebe2b` da branch `submission` — imagens `v0.25-lean` (APIs) + `v0.24-lbfd` (LB) |
 
-A configuração final travada (v0.25) evoluiu além do que a `main` documenta (v0.23): acrescenta o loop keep-warm via `epoll_pwait2` com timeout de 60 µs, `TCP_DEFER_ACCEPT` no LB e o layout de cpuset APIs 0/1 + LB "2,3". O código-fonte dessas imagens vive na branch `v0.24-keepwarm`; o processo de promoção está em docs/how-to/sync-submission-branch.md.
+A configuração final travada (v0.25) acrescenta à linha v0.23 o loop keep-warm via `epoll_pwait2` com timeout de 60 µs, `TCP_DEFER_ACCEPT` no LB e o layout de cpuset APIs 0/1 + LB "2,3" (ADR 0007). O código dessas imagens está na `main` desde o merge da branch `v0.24-keepwarm`, e o `docker-compose.yml` da raiz espelha a configuração avaliada; o processo de promoção para a branch `submission` está em docs/how-to/sync-submission-branch.md.
 
 ## Stack
 
@@ -62,9 +62,9 @@ Em runtime o sistema é autocontido: o dataset de referência é pré-processado
 ```mermaid
 flowchart TB
     client["👤 Cliente k6"]
-    lb["lb — lbfd<br/><i>[Container: C]</i><br/>0.10 CPU / 30 MB, cpuset 3"]
-    api1["api1 — api<br/><i>[Container: C, scratch]</i><br/>0.45 CPU / 160 MB, cpuset 1"]
-    api2["api2 — api<br/><i>[Container: C, scratch]</i><br/>0.45 CPU / 160 MB, cpuset 2"]
+    lb["lb — lbfd<br/><i>[Container: C]</i><br/>0.02 CPU / 30 MB, cpuset 2,3"]
+    api1["api1 — api<br/><i>[Container: C, scratch]</i><br/>0.49 CPU / 160 MB, cpuset 0"]
+    api2["api2 — api<br/><i>[Container: C, scratch]</i><br/>0.49 CPU / 160 MB, cpuset 1"]
     idx["index.bin<br/><i>[KD-tree v14, ~118 MB, mmap]</i>"]
 
     client -->|"TCP :9999 (accept4)"| lb
@@ -82,14 +82,14 @@ flowchart TB
 
 O detalhe central: o `lbfd` só participa do **estabelecimento** da conexão. Ele repassa o socket aceito para uma das APIs via `SCM_RIGHTS` e, a partir daí, a API conversa diretamente com o cliente pela vida inteira da conexão keep-alive — zero hops de proxy no caminho dos dados. Detalhes em docs/ARCHITECTURE.md.
 
-Os números do diagrama refletem o compose da `main` (v0.23). A configuração final submetida (branch `submission`, v0.25) mantém a mesma topologia com outro posicionamento: APIs nos cpus 0/1 com 0,49 CPU cada e LB em "2,3" com 0,02 CPU.
+Os números do diagrama são os da configuração final avaliada (v0.25), que o `docker-compose.yml` da raiz espelha.
 
 ### Codemap
 
 ```
 rinha_2026/
 ├── c-impl/                  # Solução atual (submissão)
-│   ├── src/                 #   API HTTP em C: server (epoll ET), http, json,
+│   ├── src/                 #   API HTTP em C: server (epoll + keep-warm), http, json,
 │   │                        #   vectorize, search (KD-tree 5-NN), index (mmap),
 │   │                        #   response, time_math, distance*.s (AVX2 asm)
 │   ├── lb/                  #   Load balancers: lbfd.c (FD-passing, em uso)

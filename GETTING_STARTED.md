@@ -16,7 +16,7 @@ Este caminho usa as imagens públicas já compiladas — não é preciso ter Go,
 | curl | qualquer recente | `curl --version` |
 | k6 | qualquer recente | `k6 version` |
 
-As imagens são `linux-amd64`; em outra arquitetura o Docker precisará de emulação. O `cpuset` do compose pressupõe uma máquina com pelo menos 4 CPUs lógicas (cores 1, 2 e 3 são usados).
+As imagens são `linux-amd64`; em outra arquitetura o Docker precisará de emulação. O `cpuset` do compose pressupõe uma máquina com pelo menos 4 CPUs lógicas (cores 0 a 3 são usados).
 
 ## 1. Instalação
 
@@ -109,6 +109,6 @@ Você deve ver as mensagens `Removed` para os três containers, a rede e o volum
 
 - Entenda como a requisição percorre o LB de passagem de FD, o parser e a KD-tree → docs/ARCHITECTURE.md
 - Compile a solução a partir do código-fonte e rode os testes unitários de `c-impl/tests/` → seção "Build local" em docs/ARCHITECTURE.md
-- Ajuste parâmetros de latência (`SPIN_US`, `EPOLL_TIMEOUT_MS`, cpuset) → TUNING.md
+- Ajuste parâmetros de latência (`EPOLL_IDLE_US`, `SPIN_US`, cpuset) → TUNING.md e docs/ARCHITECTURE.md
 - Promova uma configuração validada para a branch que o avaliador executa → docs/how-to/sync-submission-branch.md
 - Leia a especificação oficial do desafio → docs/spec/README.md

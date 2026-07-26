@@ -17,23 +17,23 @@ Resultado medido no ambiente local: **6000 pontos, p99 ≈ 0,42 ms**. Resultado 
 
 | | Submissão (`docker-compose.yml` da raiz) | Desenvolvimento (`c-impl/docker-compose.yml`) |
 |---|---|---|
-| Imagens | Publicadas no Docker Hub (`nelsonsimionato/rinha-backend-2026:v0.18-lbfd` e `:v0.22-fd-spin`) | Build local (`c-impl/Dockerfile`, contexto na raiz do repo) |
-| Load balancer | `lbfd` (passagem de FD) | HAProxy 2.8-alpine (`c-impl/haproxy.cfg`) |
+| Imagens | Publicadas no Docker Hub (`nelsonsimionato/rinha-backend-2026:v0.24-lbfd` e `:v0.25-lean`) | Build local (`c-impl/Dockerfile`, contexto na raiz do repo) |
+| Load balancer | `lbfd` (passagem de FD, `DEFER_ACCEPT=1`) | HAProxy 2.8-alpine (`c-impl/haproxy.cfg`) |
 | Índice | Embutido na imagem | Copiado de `resources/index.bin` — exige `make index` antes |
-| Limites | `cpus` 0.45/0.45/0.10, mem 160/160/30 MB, `cpuset` 1/2/3 | `cpu_period` 10 ms + `cpu_quota` (0.45/0.45/0.10), mesmas memórias |
-| Uso | O que o avaliador oficial roda | Iterar no código C sem publicar imagem |
+| Limites | `cpus` 0.49/0.49/0.02, mem 160/160/30 MB, `cpuset` 0/1/"2,3" | `cpu_period` 10 ms + `cpu_quota` (0.45/0.45/0.10), mem 160/160/30 MB |
+| Uso | Espelho da configuração final avaliada | Iterar no código C sem publicar imagem |
 
 O período CFS de 10 ms na topologia de desenvolvimento (contra os 100 ms default) limita qualquer janela de throttle a 10 ms, o que protege o p99 quando a quota estoura.
 
-Há ainda uma terceira ponta: a **branch `submission`**, que contém apenas os arquivos que o avaliador executa (`docker-compose.yml` na raiz, `info.json`, `LICENSE`) e evoluiu além da `main`. A configuração final travada (commit `dbebe2b`, v0.25) usa as imagens `v0.25-lean` + `v0.24-lbfd` com keep-warm (`EPOLL_IDLE_US=60` via `epoll_pwait2`), `BUSY_POLL_US=5`, `TCP_DEFER_ACCEPT` no LB e layout APIs cpu 0/1 (0,49 cada) + LB "2,3" (0,02). O código dessas imagens vive na branch `v0.24-keepwarm` (v0.24 a v0.27; a v0.27 ficou fora da submissão) — as variáveis `EPOLL_IDLE_US`, `BUSY_POLL_US` e `DEFER_ACCEPT` existem só nesse código, não no `server.c` da `main`. O processo de promoção está em `docs/how-to/sync-submission-branch.md`.
+Há ainda uma terceira ponta: a **branch `submission`**, que contém apenas os arquivos que o avaliador executa (`docker-compose.yml` na raiz, `info.json`, `LICENSE`). A configuração final travada nela (commit `dbebe2b`, v0.25) é a que o compose da raiz espelha; o código correspondente (linha v0.24–v0.27, desenvolvida na branch `v0.24-keepwarm`) foi mergeado na `main` — a v0.27 (busca SoA, `SEARCH_V2`) está no código mas ficou fora da submissão, desligada por default. O processo de promoção está em `docs/how-to/sync-submission-branch.md`.
 
 ## O caminho da requisição
 
 ```mermaid
 sequenceDiagram
     participant C as Cliente (k6)
-    participant L as lbfd (cpu 3)
-    participant A as api1 ou api2 (cpu 1 ou 2)
+    participant L as lbfd (cpus 2,3)
+    participant A as api1 ou api2 (cpu 0 ou 1)
 
     Note over L,A: Na subida: cada api cria seu socket AF_UNIX<br/>(/sock/apiN.sock, volume compartilhado); o lbfd conecta com retry
     C->>L: TCP connect :9999
@@ -47,7 +47,7 @@ sequenceDiagram
 Pontos que definem o custo por requisição:
 
 1. **Zero hops de proxy.** O `lbfd` (`c-impl/lb/lbfd.c`) só participa do estabelecimento: `accept4()` na :9999 e repasse do FD via `SCM_RIGHTS` pelo socket unix. Toda a vida útil da conexão keep-alive é servida diretamente pela API. O balanceamento é round-robin **por conexão nova**, como a regra do desafio exige.
-2. **Servidor de evento único.** Cada API é um processo de uma thread com epoll edge-triggered (`server.c`), sem alocação no caminho quente. A API também mantém um listener TCP próprio (porta 8080) usado pelo healthcheck `/ready`; o canal `FDSOCK` é adicional.
+2. **Servidor de evento único.** Cada API é um processo de uma thread com epoll (`server.c`) — level-triggered para conexões de clientes desde a v0.25 ("lean path": mapa de FD O(1), leitura em um único `recv`), edge-triggered apenas no canal de handoff do LB — sem alocação no caminho quente. A API também mantém um listener TCP próprio (porta 8080) usado pelo healthcheck `/ready`; o canal `FDSOCK` é adicional.
 3. **Parsing especializado.** `http.c` reconhece apenas as duas rotas do contrato; `json.c` decodifica apenas o shape do payload de fraude, guardando strings como fatias do buffer de leitura (zero cópia). Payload malformado nunca vira 4xx/5xx — vira a resposta fallback `approved:true, fraud_score:0.0` (erro HTTP pesa mais que falso negativo na pontuação).
 4. **Resposta pré-formatada.** Só existem 6 respostas possíveis (`fraud_count` 0..5). `response.c` mantém as 6 já serializadas com headers + body no mesmo buffer: um único `write()` por resposta.
 
@@ -92,16 +92,21 @@ O compute por requisição é da ordem de dezenas de microssegundos; o p99 passa
 
 | Variável | Onde é lida | Default | Efeito |
 |---|---|---|---|
-| `EPOLL_TIMEOUT_MS` | `server.c` | −1 (bloqueia) | `1` acorda o loop a cada 1 ms — mantém o core fora de idle profundo |
+| `EPOLL_IDLE_US` | `server.c` | 0 (desligado) | Keep-warm: bloqueia em `epoll_pwait2` com timeout de N µs e re-bloqueia no timeout — o core nunca prevê ociosidade longa, fica no C-state raso C1 com clock alto; custo limitado (~2–3% de CPU) independente da carga. Fallback para `epoll_wait` em ms se `epoll_pwait2` não existir |
 | `SPIN_US` | `server.c` | 0 (desligado) | Busy-poll de até N µs antes de bloquear no epoll — captura a próxima requisição sem pagar wakeup do scheduler |
+| `EPOLL_TIMEOUT_MS` | `server.c` | −1 (bloqueia) | `1` acorda o loop a cada 1 ms — usado como fallback quando o keep-warm está desligado ou indisponível |
+| `BUSY_POLL_US` | `server.c` | 0 (desligado) | NAPI busy-poll integrado ao epoll (kernel ≥ 6.9); best-effort — sem privilégio costuma ser no-op |
 | `WARMUP_QUERIES` | `main.c` → `server_warmup` | 0 | N buscas sobre vetores do índice antes de servir — aquece branch predictor, I-cache e dados quentes |
 | `FDSOCK` | `server.c` | vazio (desligado) | Caminho do socket unix onde a API recebe FDs do `lbfd` |
+| `DEFER_ACCEPT` | `lb/lbfd.c` | 0 (desligado) | `TCP_DEFER_ACCEPT` no listener do LB: o accept só acorda quando os primeiros bytes chegaram — o FD repassado já está legível |
+| `INDEX_HUGE` / `INDEX_MLOCK` | `index.c` | desligados | THP (`madvise`) e `mlock` no índice mapeado — sondagem v0.26, não usada na submissão |
+| `SEARCH_V2` | `index.c` | desligado | Kernel de busca SoA por chunks de folha (v0.27) — exato, mas não transferiu ganho no avaliador; base para a próxima edição |
 | `PORT` | `main.c` | 8080 | Porta do listener TCP próprio (healthcheck) |
 | `INDEX_PATH` | `main.c` | `/resources/index.bin` | Caminho do índice |
 
-A submissão roda com `EPOLL_TIMEOUT_MS=1`, `SPIN_US=50` e `WARMUP_QUERIES=5000`.
+A configuração final avaliada roda com `EPOLL_IDLE_US=60`, `SPIN_US=0`, `EPOLL_TIMEOUT_MS=1`, `BUSY_POLL_US=5`, `WARMUP_QUERIES=5000` e, no LB, `DEFER_ACCEPT=1` (ADR 0007).
 
-**Layout de cpuset (o maior alavancador medido):** `api1`→cpu 1, `api2`→cpu 2, `lb`→cpu 3, deixando o cpu 0 livre para SO/IRQs e para o gerador de carga. `cpuset` é posicionamento, não quota — não conta contra o limite de 1 CPU. O layout alternativo `0/1/2,3` regrediu o score (api1 no core de IRQs, LB nos irmãos de hyperthread das APIs); o racional está no cabeçalho do `docker-compose.yml`.
+**Layout de cpuset (o maior alavancador medido):** `cpuset` é posicionamento, não quota — não conta contra o limite de 1 CPU. O layout `1/2/3` (cpu 0 livre para SO/IRQs) foi o que destravou o 6000 local na v0.23; a configuração final convergiu para **APIs nos cpus 0/1 (um por core físico) e LB em "2,3" (os irmãos de hyperthread, 0,02 CPU)** — o layout de consenso das entradas mais rápidas do leaderboard. O racional está no cabeçalho do `docker-compose.yml` e no ADR 0007.
 
 ## Pipeline offline (Go)
 
